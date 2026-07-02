@@ -193,12 +193,45 @@ install_on_target() {
   log "================================================================"
 
   # 1. install filebrowser inside the CT
+  #
+  # We used to pipe upstream's `get.sh` installer, but that script's version
+  # parser broke sometime around filebrowser v2.60 — it grabs a "latest release"
+  # from the GitHub API but the extraction returns empty, leaving the download
+  # URL as ".../releases/download//linux-amd64-filebrowser.tar.gz" (double
+  # slash, 404). Rather than debug the upstream shell script we install the
+  # binary directly. Repo + asset naming are stable since v2.30.x
+  # (linux-amd64-filebrowser.tar.gz). We resolve the latest release tag via
+  # the GitHub API (with a pinned FILEBROWSER_VERSION fallback so a broken
+  # API doesn't take us down).
   if pct exec "$target_ctid" -- bash -lc 'command -v filebrowser' >/dev/null 2>&1; then
     log "filebrowser already installed on $target_hostname."
   else
-    log "Installing filebrowser via the official one-liner on $target_hostname..."
-    # The official installer drops the binary at /usr/local/bin/filebrowser.
-    run "pct exec $target_ctid -- bash -lc 'apt-get update -qq && apt-get install -y -qq curl && curl -fsSL https://raw.githubusercontent.com/filebrowser/get/master/get.sh | bash'"
+    log "Installing filebrowser directly on $target_hostname (bypassing upstream get.sh — parser bug)..."
+    local fb_version="${FILEBROWSER_VERSION:-}"
+    run "pct exec $target_ctid -- bash -lc '
+      set -e
+      apt-get update -qq
+      apt-get install -y -qq curl ca-certificates tar
+
+      # Resolve latest tag from the GitHub API. Falls back to a pinned version
+      # if the API is unreachable, rate-limited, or returns garbage. Update
+      # this pin when a filebrowser release breaks something and you need
+      # customer installs to stay pinned to the last-known-good.
+      FB_VER=\"${fb_version:-}\"
+      if [[ -z \"\$FB_VER\" ]]; then
+        FB_VER=\$(curl -sSf https://api.github.com/repos/filebrowser/filebrowser/releases/latest 2>/dev/null \
+          | grep -m1 tag_name | cut -d\\\" -f4)
+      fi
+      [[ -n \"\$FB_VER\" ]] || FB_VER=\"v2.63.17\"   # last-known-good pin (verified 2026-07-02)
+      echo \"    Installing filebrowser \$FB_VER\"
+
+      cd /tmp
+      curl -fsSL \"https://github.com/filebrowser/filebrowser/releases/download/\$FB_VER/linux-amd64-filebrowser.tar.gz\" -o filebrowser.tar.gz
+      tar -xzf filebrowser.tar.gz
+      install -m 755 filebrowser /usr/local/bin/filebrowser
+      rm -f filebrowser.tar.gz filebrowser LICENSE CHANGELOG.md README.md 2>/dev/null || true
+      filebrowser version
+    '"
   fi
 
   # 2. ensure the file root exists

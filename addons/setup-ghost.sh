@@ -387,27 +387,25 @@ log "  Admin email: $ADMIN_EMAIL"
 log "  SMTP host:   $SMTP_HOST:$SMTP_PORT"
 log "  SMTP from:   $SMTP_FROM"
 
-# ----- Discover Ghost install --------------------------------------------
-# Community-scripts installs Ghost under a specific user + directory.
-# `ghost ls` output lists all installs — parse the first one.
-log "Discovering Ghost install directory + user..."
-
-if ! pct_exec "$GHOST_CTID" "command -v ghost >/dev/null 2>&1"; then
-  die "ghost-cli not found in CT $GHOST_CTID. Community-scripts ct/ghost.sh must run first."
-fi
-
-GHOST_DIR="$(pct_exec "$GHOST_CTID" "ghost ls 2>/dev/null | awk 'NR==4 {print \$4}'" || echo "")"
-GHOST_USER="$(pct_exec "$GHOST_CTID" "ghost ls 2>/dev/null | awk 'NR==4 {print \$6}'" || echo "")"
-
-# Fallback if ghost ls doesn't parse cleanly — use conventional paths
-[[ -z "$GHOST_DIR" ]] && GHOST_DIR="/var/www/ghost"
-[[ -z "$GHOST_USER" ]] && GHOST_USER="ghost"
+# ----- Ghost install paths + user ----------------------------------------
+# Since setup-ghost.sh now owns the install (community-scripts dropped
+# their helper), these are known constants:
+#   /var/www/ghost — install directory (hardcoded in install_ghost_stack)
+#   ghost-mgr      — the sudo user we run ghost-cli commands as (has a
+#                    real home dir, unlike the 'ghost' system user which
+#                    ghost install creates for daemon ownership only —
+#                    that user has no shell + no /home/ghost, so
+#                    `su - ghost -c 'ghost stop'` fails with EACCES on
+#                    /home/ghost/.ghost/logs)
+GHOST_DIR="/var/www/ghost"
+GHOST_USER="ghost-mgr"
 
 log "  Ghost dir:  $GHOST_DIR"
-log "  Ghost user: $GHOST_USER"
+log "  Ghost user: $GHOST_USER (ghost-cli commands run as this user, NOT the 'ghost' daemon user)"
 
 pct_exec "$GHOST_CTID" "test -d $GHOST_DIR" || \
-  die "Ghost directory $GHOST_DIR not found inside CT $GHOST_CTID."
+  die "Ghost directory $GHOST_DIR not found inside CT $GHOST_CTID.
+  install_ghost_stack should have created it — this is a bug."
 
 # ----- Webhook-only mode short-circuit -----------------------------------
 if (( WEBHOOK_ONLY )); then
@@ -460,21 +458,22 @@ PYEOF
 
     # Push the patcher via stdin so we don't have to write a temp file
     echo "$PATCHER" | pct exec "$GHOST_CTID" -- bash -c "cat > /tmp/ghost-patch.py"
+    # su - starts a fresh login shell that DOESN'T inherit exports from
+    # the outer bash context — env vars must be passed inline on the
+    # su -c command line. Also: ghost-mgr must own config.production.json
+    # for the patcher (writing as ghost-mgr) to save changes.
     pct exec "$GHOST_CTID" -- bash -c "
-      export CONFIG_PATH='$GHOST_DIR/config.production.json'
-      export DOMAIN='$DOMAIN'
-      export SMTP_HOST='$SMTP_HOST'
-      export SMTP_PORT='$SMTP_PORT'
-      export SMTP_USERNAME='$SMTP_USERNAME'
-      export SMTP_PASSWORD=\$(cat <<'SMTPPWEOF'
-$SMTP_PASSWORD
-SMTPPWEOF
-)
-      # Trim trailing newline from heredoc
-      export SMTP_PASSWORD=\"\${SMTP_PASSWORD%\$'\\n'}\"
-      export SMTP_FROM='$SMTP_FROM'
       chown $GHOST_USER:$GHOST_USER '$GHOST_DIR/config.production.json'
-      su - $GHOST_USER -c 'cd $GHOST_DIR && python3 /tmp/ghost-patch.py'
+      su - $GHOST_USER -c \"
+        CONFIG_PATH='$GHOST_DIR/config.production.json' \
+        DOMAIN='$DOMAIN' \
+        SMTP_HOST='$SMTP_HOST' \
+        SMTP_PORT='$SMTP_PORT' \
+        SMTP_USERNAME='$SMTP_USERNAME' \
+        SMTP_PASSWORD='$SMTP_PASSWORD' \
+        SMTP_FROM='$SMTP_FROM' \
+        python3 /tmp/ghost-patch.py
+      \"
       rm -f /tmp/ghost-patch.py
     "
   else

@@ -88,6 +88,18 @@ read_token() {
   printf '%s\n' "$val"
 }
 
+# upsert_token — write/overwrite a KEY=value pair in tokens.
+upsert_token() {
+  local key="$1" val="$2"
+  (( DRY_RUN )) && return 0
+  [[ -f "$TOKENS_FILE" ]] || { touch "$TOKENS_FILE"; chmod 600 "$TOKENS_FILE"; }
+  if grep -q "^${key}=" "$TOKENS_FILE"; then
+    sed -i "s|^${key}=.*|${key}=${val}|" "$TOKENS_FILE"
+  else
+    echo "${key}=${val}" >> "$TOKENS_FILE"
+  fi
+}
+
 # pct_exec — run inside CT, returns exit code + stdout
 pct_exec() {
   local ctid="$1"; shift
@@ -97,7 +109,14 @@ pct_exec() {
 # ----- pre-flight --------------------------------------------------------
 log "Pre-flight..."
 
+# Shared CT lifecycle helpers (ct_wait_ready, ts_ensure_joined, etc)
+# shellcheck source=lib/ct-helpers.sh
+if [[ -r "$(dirname "${BASH_SOURCE[0]}")/lib/ct-helpers.sh" ]]; then
+  source "$(dirname "${BASH_SOURCE[0]}")/lib/ct-helpers.sh"
+fi
+
 GHOST_CTID="$(read_token GHOST_CTID || echo 300)"
+GHOST_HOSTNAME="${GHOST_HOSTNAME:-ghost}"
 DOMAIN="$(read_token DOMAIN || die "DOMAIN missing from $TOKENS_FILE")"
 ADMIN_USER="$(read_token ADMIN_USER || die "ADMIN_USER missing")"
 ADMIN_EMAIL="$(read_token ADMIN_EMAIL || die "ADMIN_EMAIL missing")"
@@ -109,11 +128,102 @@ SMTP_USERNAME="$(read_token SMTP_USERNAME || die "SMTP_USERNAME missing")"
 SMTP_PASSWORD="$(read_token SMTP_PASSWORD || die "SMTP_PASSWORD missing")"
 SMTP_FROM="$(read_token SMTP_FROM || echo "\"Ghost\" <no-reply@${DOMAIN}>")"
 
-# CT existence + running check
-pct status "$GHOST_CTID" >/dev/null 2>&1 || \
-  die "CT $GHOST_CTID not found. Run studio-stack bootstrap first."
-[[ "$(pct status "$GHOST_CTID")" == *running* ]] || \
-  { log "Starting CT $GHOST_CTID..."; run "pct start $GHOST_CTID"; sleep 3; }
+# CT auto-create prerequisites — read only if we need to actually create
+TS_AUTHKEY="$(read_token TS_AUTHKEY || true)"
+CT_PASSWORD="$(read_token CT_PASSWORD || true)"
+
+GHOST_HELPER_URL="${GHOST_HELPER_URL:-https://github.com/community-scripts/ProxmoxVE/raw/main/ct/ghost.sh}"
+
+# Find CT by hostname (matches setup-postgres-shared.sh pattern from #267)
+find_ct_by_hostname() {
+  local want="$1" c hn
+  for c in $(pct list 2>/dev/null | awk 'NR>1 {print $1}'); do
+    hn="$(pct config "$c" 2>/dev/null | awk '/^hostname:/ {print $2}')"
+    [[ "$hn" == "$want" ]] && { echo "$c"; return 0; }
+  done
+  return 1
+}
+
+EXISTING_CTID="$(find_ct_by_hostname "$GHOST_HOSTNAME" 2>/dev/null || true)"
+if [[ -n "$EXISTING_CTID" ]]; then
+  log "  Found existing CT $EXISTING_CTID ($GHOST_HOSTNAME) — using it."
+  GHOST_CTID="$EXISTING_CTID"
+else
+  log "  No CT named '$GHOST_HOSTNAME' found — creating via community-scripts ghost.sh..."
+  [[ -n "$CT_PASSWORD" ]] || die "CT_PASSWORD required in $TOKENS_FILE to create a new CT."
+
+  # Auto-allocate CTID if the preferred one is taken
+  if pct status "$GHOST_CTID" >/dev/null 2>&1; then
+    GHOST_CTID="$(pvesh get /cluster/nextid 2>/dev/null | tr -d '"')"
+    log "  Preferred CTID taken; auto-allocated $GHOST_CTID."
+  fi
+
+  # SSH pubkey from authorized_keys (skip PVE auto-generated)
+  PVE_HOST="$(hostname -s)"
+  SSH_KEY=""
+  [[ -f /root/.ssh/authorized_keys ]] && \
+    SSH_KEY="$(awk -v skip="root@$PVE_HOST" '/^ssh-/ && $NF != skip { print; exit }' /root/.ssh/authorized_keys)"
+
+  if (( DRY_RUN )); then
+    log "  [dry-run] would run community-scripts ghost.sh (CTID=$GHOST_CTID, hostname=$GHOST_HOSTNAME)"
+  else
+    var_ctid="$GHOST_CTID" \
+    var_hostname="$GHOST_HOSTNAME" \
+    var_ssh=yes \
+    var_ssh_authorized_key="$SSH_KEY" \
+    var_gpu=no \
+    bash -c "$(curl -fsSL "$GHOST_HELPER_URL")"
+
+    # Detect actual CTID (helper may have chosen a different one)
+    ACTUAL_CTID="$(find_ct_by_hostname "$GHOST_HOSTNAME" 2>/dev/null || true)"
+    if [[ -n "$ACTUAL_CTID" && "$ACTUAL_CTID" != "$GHOST_CTID" ]]; then
+      log "  Helper assigned CTID $ACTUAL_CTID — switching."
+      GHOST_CTID="$ACTUAL_CTID"
+    fi
+    [[ -n "$GHOST_CTID" ]] || die "Ghost CT didn't come up — see community-scripts output above."
+    upsert_token GHOST_CTID "$GHOST_CTID"
+
+    # TUN passthrough so Tailscale can run
+    CT_CONF="/etc/pve/lxc/$GHOST_CTID.conf"
+    if ! grep -q "/dev/net/tun" "$CT_CONF" 2>/dev/null; then
+      log "  Adding /dev/net/tun passthrough..."
+      cat >> "$CT_CONF" <<'TUN_BLOCK'
+lxc.cgroup2.devices.allow: c 10:200 rwm
+lxc.mount.entry: /dev/net/tun dev/net/tun none bind,create=file
+TUN_BLOCK
+      pct reboot "$GHOST_CTID"
+      log "  Waiting for CT to come back after reboot..."
+      declare -F ct_wait_ready >/dev/null && ct_wait_ready "$GHOST_CTID" || sleep 15
+    fi
+
+    # Tailscale install + join
+    if [[ -n "$TS_AUTHKEY" ]] && declare -F ts_ensure_joined >/dev/null; then
+      log "  Installing tailscale + joining tailnet as '$GHOST_HOSTNAME'..."
+      if ! pct exec "$GHOST_CTID" -- tailscale --version >/dev/null 2>&1; then
+        pct exec "$GHOST_CTID" -- bash -lc '
+          set -e
+          export DEBIAN_FRONTEND=noninteractive
+          . /etc/os-release
+          apt-get update -qq
+          apt-get install -y -qq curl ca-certificates
+          curl -fsSL "https://pkgs.tailscale.com/stable/${ID}/${VERSION_CODENAME}.noarmor.gpg" \
+            | tee /usr/share/keyrings/tailscale-archive-keyring.gpg >/dev/null
+          echo "deb [signed-by=/usr/share/keyrings/tailscale-archive-keyring.gpg] https://pkgs.tailscale.com/stable/${ID} ${VERSION_CODENAME} main" \
+            > /etc/apt/sources.list.d/tailscale.list
+          apt-get update -qq
+          apt-get install -y -qq tailscale
+        ' 2>&1 | sed 's/^/    /'
+      fi
+      ts_ensure_joined "$GHOST_CTID" "$TS_AUTHKEY" "$GHOST_HOSTNAME" || \
+        warn "  Tailscale join returned non-zero — continuing (LAN-only fallback ok)."
+    fi
+  fi
+fi
+
+# Verify CT is running
+if ! pct status "$GHOST_CTID" 2>/dev/null | grep -q running; then
+  die "CT $GHOST_CTID not running. Try: pct start $GHOST_CTID"
+fi
 
 log "  Ghost CTID:  $GHOST_CTID"
 log "  Domain:      $DOMAIN"

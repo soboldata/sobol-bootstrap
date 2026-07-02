@@ -1,0 +1,44 @@
+[Unit]
+Description=Pi Mattermost Bridge
+Documentation=https://www.npmjs.com/package/@whonixnetworks/pi-mattermost
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# %%NODE_BIN%% and %%PKG_DIR%% get rewritten by setup-pi-mattermost-bridge.sh
+# to the actual pi-node version installed on this host.
+ExecStart=%%NODE_BIN%% %%PKG_DIR%%/bin/pi-mattermost.js start --config /root/.config/pi-mattermost/config.toml
+Restart=on-failure
+RestartSec=10
+
+# PATH includes pi-node's bin first so any child npm/node calls resolve to
+# the same Node that's running the bridge (avoids version skew if system
+# Node is also installed).
+Environment=PATH=%%NODE_BIN_DIR%%:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+StandardOutput=journal
+StandardError=journal
+
+# Security hardening — relaxed for Node.js compatibility, mirrors what
+# whonixnetworks ships in their user-service template.
+NoNewPrivileges=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/root/.local/share/pi-mattermost /root/.config/pi-mattermost
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectClock=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

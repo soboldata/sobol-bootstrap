@@ -1,0 +1,373 @@
+{
+  "name": "Comms agent — daily Slack digest",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 9 * * *"
+            }
+          ]
+        }
+      },
+      "id": "ccccdgst-1111-1111-1111-cccccccccccc",
+      "name": "Daily 9am",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        240,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "comms-agent-digest",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "ccccdgst-2222-2222-2222-cccccccccccc",
+      "name": "Manual trigger (webhook)",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        240,
+        500
+      ],
+      "webhookId": "comms-agent-digest"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Aggregate everything the persona needs into a single JSON blob.\n-- This avoids many round trips and keeps the LLM context window contiguous.\nSELECT json_build_object(\n  'date', CURRENT_DATE,\n  'sync_freshness_minutes', (\n    SELECT EXTRACT(EPOCH FROM (NOW() - MAX(last_sync_ts))) / 60\n    FROM _meta.sync_state WHERE source = 'slack'\n  ),\n  'message_count_24h', (\n    SELECT COUNT(*) FROM agent_view.slack_recent_24h\n  ),\n  'active_channel_count_24h', (\n    SELECT COUNT(DISTINCT channel) FROM agent_view.slack_recent_24h\n  ),\n  'channel_activity', (\n    SELECT COALESCE(json_agg(row_to_json(t)), '[]'::json)\n    FROM (\n      SELECT channel, message_count, active_user_count, top_user\n      FROM agent_view.slack_channel_activity_24h\n      ORDER BY message_count DESC\n      LIMIT 8\n    ) t\n  ),\n  'unanswered_questions', (\n    SELECT COALESCE(json_agg(row_to_json(t)), '[]'::json)\n    FROM (\n      SELECT channel, op_user, op_text, age_hours\n      FROM agent_view.slack_threads_with_questions\n      WHERE age_hours BETWEEN 6 AND 48\n      ORDER BY age_hours DESC\n      LIMIT 5\n    ) t\n  ),\n  'decisions', (\n    SELECT COALESCE(json_agg(row_to_json(t)), '[]'::json)\n    FROM (\n      SELECT channel, user_real_name, text, ts\n      FROM agent_view.slack_threads_with_decisions\n      WHERE ts::numeric >= EXTRACT(EPOCH FROM NOW() - INTERVAL '24 hours')\n      ORDER BY ts DESC\n      LIMIT 5\n    ) t\n  ),\n  'action_items', (\n    SELECT COALESCE(json_agg(row_to_json(t)), '[]'::json)\n    FROM (\n      SELECT channel, assignee_user, action_text, ts\n      FROM agent_view.slack_action_items\n      WHERE ts::numeric >= EXTRACT(EPOCH FROM NOW() - INTERVAL '24 hours')\n      ORDER BY ts DESC\n      LIMIT 5\n    ) t\n  ),\n  'high_reaction_messages', (\n    SELECT COALESCE(json_agg(row_to_json(t)), '[]'::json)\n    FROM (\n      SELECT channel, user_real_name, text, reaction_count\n      FROM agent_view.slack_high_reaction_messages_24h\n      ORDER BY reaction_count DESC\n      LIMIT 5\n    ) t\n  ),\n  'quiet_users', (\n    SELECT COALESCE(json_agg(row_to_json(t)), '[]'::json)\n    FROM (\n      SELECT user_real_name, avg_prior_weeks, this_week\n      FROM agent_view.slack_quiet_users_7d\n      LIMIT 5\n    ) t\n  )\n) AS data;",
+        "options": {}
+      },
+      "id": "ccccdgst-3333-3333-3333-cccccccccccc",
+      "name": "Gather digest data",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        520,
+        400
+      ],
+      "credentials": {
+        "postgres": {
+          "name": "Sobol Mirror (read-only)"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Build the LLM prompt from the persona definition + the data we just\n// queried. The persona's SYSTEM.md content is embedded here intentionally:\n// the workflow IS the runtime, so the prompt lives where the runtime lives.\n// If the persona SYSTEM.md changes, this workflow should be regenerated\n// from the persona file (TBD: a deploy-persona-to-workflow helper).\n\nconst data = $json.data || {};\nconst staleness = data.sync_freshness_minutes || 0;\n\n// Skip path: sync is stuck\nif (staleness > 120) {\n  return [{\n    json: {\n      skip: true,\n      reason: 'sync_stale',\n      text: `:warning: Slack sync hasn't run in ${Math.round(staleness)} minutes. Today's digest is skipped. Check n8n executions for the slack-mirror-sync workflow.`,\n      staleness_minutes: staleness\n    }\n  }];\n}\n\n// Skip path: nothing happened\nif ((data.message_count_24h || 0) === 0) {\n  return [{\n    json: {\n      skip: true,\n      reason: 'quiet_day',\n      text: `:sunrise: Slack digest — ${new Date().toLocaleDateString('en-US', {weekday: 'long', month: 'long', day: 'numeric'})}\\n\\nQuiet day yesterday. No messages in any monitored channel.`\n    }\n  }];\n}\n\nconst systemPrompt = `You are the communications agent for a small team that uses Slack. You read the Slack workspace (via a read-only postgres mirror, updated hourly) and post insights to Mattermost. Your goal is to make the operator feel they have a high-leverage view of their Slack without reading every channel.\n\nTone: plain prose, short sentences, concrete. Name channels, name themes, paraphrase faithfully. No filler phrases like 'continues to demonstrate' or 'as we move forward'. No editorializing about individuals.\n\nProduce a morning digest with this structure:\n\\`\\`\\`\n:sunrise: **Slack digest — <weekday, date>**\n\n**Yesterday across <N> channels:** <one sentence about volume + themes>\n\n**Worth your attention:**\n- <thread or item 1: 1-2 sentences explaining why>\n- <thread or item 2>\n- <thread or item 3>\n\n**Dangling:** <questions without replies, if any — optional section>\n\n**Quiet:** <users who used to post regularly, didn't this week — optional section, only if pattern is meaningful>\n\\`\\`\\`\n\nReading time target: 60-90 seconds. If the data is thin, the digest is short. Don't pad. Sections are optional. Drop a section if it has nothing in it.\n\nDo NOT include verbatim quotes longer than 30 words. Paraphrase. Do NOT name individuals as 'unproductive' or 'noisy'. Activity patterns can be reported neutrally.`;\n\nconst dateStr = new Date().toLocaleDateString('en-US', {weekday: 'long', month: 'long', day: 'numeric'});\n\nconst userPrompt = `Compose today's morning Slack digest for ${dateStr}.\n\nHere is the data from the postgres mirror:\n\n**Volume:** ${data.message_count_24h} messages across ${data.active_channel_count_24h} active channels in the last 24 hours.\n\n**Channel activity (top channels yesterday):**\n${JSON.stringify(data.channel_activity, null, 2)}\n\n**Unanswered questions in threads (age between 6 and 48 hours):**\n${JSON.stringify(data.unanswered_questions, null, 2)}\n\n**Messages indicating decisions being discussed (last 24h):**\n${JSON.stringify(data.decisions, null, 2)}\n\n**Action items assigned to people (last 24h):**\n${JSON.stringify(data.action_items, null, 2)}\n\n**Messages with high reaction counts (>3, last 24h):**\n${JSON.stringify(data.high_reaction_messages, null, 2)}\n\n**Users quieter than usual this week:**\n${JSON.stringify(data.quiet_users, null, 2)}\n\nNow produce the digest. Reading time 60-90 sec. If nothing in a section is signal, drop the section. Lead with what's worth their attention.`;\n\nreturn [{\n  json: {\n    skip: false,\n    system_prompt: systemPrompt,\n    user_prompt: userPrompt,\n    raw_data: data\n  }\n}];"
+      },
+      "id": "ccccdgst-4444-4444-4444-cccccccccccc",
+      "name": "Build LLM prompt",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        800,
+        400
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "typeValidation": "loose"
+          },
+          "conditions": [
+            {
+              "id": "skip-gate",
+              "leftValue": "={{$json.skip}}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "false",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "ccccdgst-5555-5555-5555-cccccccccccc",
+      "name": "Should we call LLM?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        1080,
+        400
+      ]
+    },
+    {
+      "parameters": {
+        "url": "http://ollama-pi-agent:11434/api/chat",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"model\": \"{{$env.COMMS_AGENT_MODEL || 'qwen2.5:14b'}}\",\n  \"messages\": [\n    {\"role\": \"system\", \"content\": {{JSON.stringify($json.system_prompt)}} },\n    {\"role\": \"user\", \"content\": {{JSON.stringify($json.user_prompt)}} }\n  ],\n  \"stream\": false,\n  \"options\": {\n    \"temperature\": 0.3,\n    \"num_predict\": 800\n  }\n}",
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "json"
+            }
+          },
+          "timeout": 120000
+        }
+      },
+      "id": "ccccdgst-6666-6666-6666-cccccccccccc",
+      "name": "Call Ollama",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1360,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Extract the LLM text. Ollama returns: { message: { role, content }, ... }\nconst content = ($json.message && $json.message.content) || '';\nif (!content || content.length < 50) {\n  return [{ json: { skip: true, reason: 'llm_short_output', text: `:warning: comms-agent produced a suspiciously short digest (${content.length} chars). Check Ollama model + prompt.` } }];\n}\nreturn [{ json: { skip: false, text: content.trim(), llm_chars: content.length } }];"
+      },
+      "id": "ccccdgst-7777-7777-7777-cccccccccccc",
+      "name": "Extract digest text",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1640,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "resource": "message",
+        "operation": "post",
+        "channelId": "={{$env.COMMS_AGENT_MM_CHANNEL || 'bot'}}",
+        "message": "={{$json.text}}"
+      },
+      "id": "ccccdgst-8888-8888-8888-cccccccccccc",
+      "name": "Post digest to Mattermost",
+      "type": "n8n-nodes-base.mattermost",
+      "typeVersion": 1,
+      "position": [
+        1920,
+        300
+      ],
+      "credentials": {
+        "mattermostApi": {
+          "name": "Mattermost (pi-bot)"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "resource": "message",
+        "operation": "post",
+        "channelId": "={{$env.COMMS_AGENT_MM_CHANNEL || 'bot'}}",
+        "message": "={{$json.text}}"
+      },
+      "id": "ccccdgst-9999-9999-9999-cccccccccccc",
+      "name": "Post skip-notice to Mattermost",
+      "type": "n8n-nodes-base.mattermost",
+      "typeVersion": 1,
+      "position": [
+        1360,
+        500
+      ],
+      "credentials": {
+        "mattermostApi": {
+          "name": "Mattermost (pi-bot)"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO _meta.agent_actions (agent, action, view_queried, rows_returned, notes)\nVALUES ('comms-agent', 'digest_morning', 'agent_view.slack_*', $1::int, $2);",
+        "options": {
+          "queryReplacement": "={{$('Gather digest data').first().json.data.message_count_24h || 0}},{{JSON.stringify({skip: $json.skip || false, chars: $json.llm_chars || 0})}}"
+        }
+      },
+      "id": "ccccdgst-aaaa-aaaa-aaaa-cccccccccccc",
+      "name": "Log to agent_actions",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        2200,
+        300
+      ],
+      "credentials": {
+        "postgres": {
+          "name": "Sobol Mirror (read-only)"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={\n  \"ok\": true,\n  \"posted\": {{!$json.skip}},\n  \"chars\": {{$json.llm_chars || 0}},\n  \"reason\": {{JSON.stringify($json.reason || 'posted')}}\n}",
+        "options": {}
+      },
+      "id": "ccccdgst-bbbb-bbbb-bbbb-cccccccccccc",
+      "name": "Respond (manual trigger)",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [
+        2480,
+        300
+      ]
+    }
+  ],
+  "connections": {
+    "Daily 9am": {
+      "main": [
+        [
+          {
+            "node": "Gather digest data",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Manual trigger (webhook)": {
+      "main": [
+        [
+          {
+            "node": "Gather digest data",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Gather digest data": {
+      "main": [
+        [
+          {
+            "node": "Build LLM prompt",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build LLM prompt": {
+      "main": [
+        [
+          {
+            "node": "Should we call LLM?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Should we call LLM?": {
+      "main": [
+        [
+          {
+            "node": "Call Ollama",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Post skip-notice to Mattermost",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Call Ollama": {
+      "main": [
+        [
+          {
+            "node": "Extract digest text",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract digest text": {
+      "main": [
+        [
+          {
+            "node": "Post digest to Mattermost",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Post digest to Mattermost": {
+      "main": [
+        [
+          {
+            "node": "Log to agent_actions",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Post skip-notice to Mattermost": {
+      "main": [
+        [
+          {
+            "node": "Log to agent_actions",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Log to agent_actions": {
+      "main": [
+        [
+          {
+            "node": "Respond (manual trigger)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "tags": [
+    "sobol-mirror",
+    "comms-agent",
+    "digest",
+    "starter"
+  ],
+  "meta": {
+    "description": "Daily 9am Slack digest from the comms-agent persona. Reads agent_view.slack_* views from the sobol_mirror postgres, passes the aggregated JSON to Ollama with the persona's system prompt embedded, posts the digest to Mattermost (default channel: bot; configurable via COMMS_AGENT_MM_CHANNEL env var). Skips with explanatory message when sync is stale (>120 min) or message volume is zero. Logs every execution to _meta.agent_actions for audit. Also exposes a webhook trigger at POST /webhook/comms-agent-digest for manual on-demand digests during development. Default model: qwen2.5:14b (configurable via COMMS_AGENT_MODEL env var). Requires: setup-postgres-mirror.sh, setup-connector-slack.sh, slack-mirror-sync.json activated and at least one successful sync. Companion to pi-personas/comms-agent/ — the persona definition + this workflow together = the runtime.",
+    "stack_dependencies": {
+      "required_apps": [
+        "mattermost",
+        "n8n",
+        "ollama-pi-agent",
+        "postgres-mirror"
+      ],
+      "optional_apps": [
+        "connector-slack"
+      ],
+      "required_features": []
+    },
+    "addon_dependencies": [
+      "setup-mattermost",
+      "setup-ollama-pi",
+      "setup-postgres-mirror",
+      "setup-connector-slack"
+    ]
+  }
+}

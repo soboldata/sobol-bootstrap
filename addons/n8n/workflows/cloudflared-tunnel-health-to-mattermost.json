@@ -1,0 +1,240 @@
+{
+  "name": "Cloudflared tunnel health → Mattermost",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "cloudflared-status",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "50505050-5050-5050-5050-505050505050",
+      "name": "Webhook (manual check)",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        240,
+        200
+      ],
+      "webhookId": "cloudflared-status"
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 * * * *"
+            }
+          ]
+        }
+      },
+      "id": "51515151-5151-5151-5151-515151515151",
+      "name": "Cron (hourly)",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        240,
+        380
+      ]
+    },
+    {
+      "parameters": {
+        "url": "=http://{{$env.CLOUDFLARED_HOST || 'cloudflared'}}:2000/metrics",
+        "options": {
+          "timeout": 5000
+        }
+      },
+      "id": "60606060-6060-6060-6060-606060606060",
+      "name": "Cloudflared /metrics",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        520,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Cloudflared exposes Prometheus-style metrics at :2000/metrics.\n// The gauge we care about is cloudflared_tunnel_ha_connections — the\n// number of active tunnel connections to the CF edge. Healthy = >= 1.\n//\n// Response body is text (Prometheus text format), not JSON — grab it\n// off the raw body if n8n wrapped it, otherwise fall back to $json.\n\nconst raw = $input.first().json;\nconst body = raw?.data || raw?.body || (typeof raw === 'string' ? raw : JSON.stringify(raw));\n\nconst grabGauge = (name) => {\n  const re = new RegExp('^' + name + '\\\\s+([0-9.eE+-]+)', 'm');\n  const m = body.match(re);\n  return m ? Number(m[1]) : null;\n};\n\nconst connections = grabGauge('cloudflared_tunnel_ha_connections') ?? 0;\nconst requestsTotal = grabGauge('cloudflared_tunnel_request_errors') ?? 0;\nconst tunnelUp = connections >= 1;\n\n// Only post to MM on state change OR when triggered manually via webhook.\n// Manual webhook is 'Webhook (manual check)'; anything else is the cron.\nconst triggerName = $execution.mode === 'trigger' ? 'cron' : 'webhook';\nconst forcePost = triggerName === 'webhook';\n\nconst emoji = tunnelUp ? ':large_green_circle:' : ':red_circle:';\nconst label = tunnelUp ? 'HEALTHY' : 'DOWN';\n\nconst message = [\n  `${emoji} **Cloudflared tunnel** — ${label}`,\n  `**Active connections:** ${connections}`,\n  `**Cumulative request errors:** ${requestsTotal}`,\n  `_(Checked at ${new Date().toISOString()})_`,\n].join('\\n');\n\nreturn [{\n  json: {\n    tunnelUp,\n    connections,\n    requestsTotal,\n    message,\n    forcePost,\n    // 'shouldPost' — the workflow's downstream branching will use this\n    shouldPost: forcePost || !tunnelUp,\n  }\n}];"
+      },
+      "id": "70707070-7070-7070-7070-707070707070",
+      "name": "Format",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        740,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose"
+          },
+          "conditions": [
+            {
+              "id": "post-condition",
+              "leftValue": "={{$json.shouldPost}}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "80808080-8080-8080-8080-808080808080",
+      "name": "Post to MM?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        940,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "resource": "message",
+        "operation": "post",
+        "channelId": "bot",
+        "message": "={{$json.message}}"
+      },
+      "id": "90909090-9090-9090-9090-909090909090",
+      "name": "Mattermost (pi-bot)",
+      "type": "n8n-nodes-base.mattermost",
+      "typeVersion": 1,
+      "position": [
+        1160,
+        220
+      ],
+      "credentials": {
+        "mattermostApi": {
+          "name": "Mattermost (pi-bot)"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={\n  \"ok\": true,\n  \"tunnelUp\": {{$('Format').item.json.tunnelUp}},\n  \"connections\": {{$('Format').item.json.connections}},\n  \"posted\": {{$('Format').item.json.shouldPost}}\n}",
+        "options": {}
+      },
+      "id": "a0a0a0a0-a0a0-a0a0-a0a0-a0a0a0a0a0a0",
+      "name": "Respond 200",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [
+        1160,
+        460
+      ]
+    }
+  ],
+  "connections": {
+    "Webhook (manual check)": {
+      "main": [
+        [
+          {
+            "node": "Cloudflared /metrics",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Cron (hourly)": {
+      "main": [
+        [
+          {
+            "node": "Cloudflared /metrics",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Cloudflared /metrics": {
+      "main": [
+        [
+          {
+            "node": "Format",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format": {
+      "main": [
+        [
+          {
+            "node": "Post to MM?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Post to MM?": {
+      "main": [
+        [
+          {
+            "node": "Mattermost (pi-bot)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond 200",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Mattermost (pi-bot)": {
+      "main": [
+        [
+          {
+            "node": "Respond 200",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "tags": [
+    "cloudflared",
+    "health"
+  ],
+  "meta": {
+    "description": "Polls cloudflared's /metrics endpoint (Prometheus text format) and reports tunnel-connection health. Cron: hourly (silent when healthy — only posts on DOWN transitions). Webhook: `/webhook/cloudflared-status` — forces a post regardless of state (use as a manual on-demand health check). Requires PLAUSIBLE_… wait no — requires CLOUDFLARED_HOST env var on n8n CT (defaults to 'cloudflared' MagicDNS name). Any stack that composes `cloudflared` can enable this — currently exercised by creator-studio.\n\nCaveat: 'silent when healthy' isn't a full td-health-style heartbeat here. Long silences after a legitimate DOWN transition can be hard to distinguish from n8n-cron-not-firing. Consider adding a dedicated healthcheck cadence + state file if this becomes a false-negative source.",
+    "stack_dependencies": {
+      "required_apps": [
+        "cloudflared",
+        "mattermost",
+        "n8n"
+      ],
+      "optional_apps": [],
+      "required_features": []
+    },
+    "addon_dependencies": [
+      "setup-cloudflared",
+      "setup-mattermost",
+      "setup-n8n"
+    ]
+  }
+}

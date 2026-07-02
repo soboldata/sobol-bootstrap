@@ -1,0 +1,196 @@
+{
+  "name": "Gitea daily digest → Mattermost",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 9 * * *"
+            }
+          ]
+        }
+      },
+      "id": "bbbbbbbb-1111-1111-1111-bbbbbbbbbbbb",
+      "name": "Daily 9am",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        240,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "url": "=http://gitea:3000/api/v1/repos/search?limit=50&sort=updated&order=desc",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "options": {}
+      },
+      "id": "bbbbbbbb-2222-2222-2222-bbbbbbbbbbbb",
+      "name": "List Gitea repos",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        520,
+        300
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "name": "Gitea (admin) — Bearer"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Build a list of {owner, repo} from the search result + filter to:\n//   - updated in last 24h\n//   - NOT empty (Gitea returns 409 on /commits for empty repos)\nconst items = $json.data || [];\nconst cutoff = Date.now() - 24*60*60*1000;\nconst keep = [];\nfor (const r of items) {\n  if (r.empty) continue;\n  if (new Date(r.updated_at).getTime() >= cutoff) {\n    keep.push({json: {owner: r.owner.login, repo: r.name, full: r.full_name, updated: r.updated_at}});\n  }\n}\nreturn keep;"
+      },
+      "id": "bbbbbbbb-3333-3333-3333-bbbbbbbbbbbb",
+      "name": "Filter recent",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        800,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "url": "=http://gitea:3000/api/v1/repos/{{$json.owner}}/{{$json.repo}}/commits?limit=10",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "options": {}
+      },
+      "id": "bbbbbbbb-4444-4444-4444-bbbbbbbbbbbb",
+      "name": "Fetch commits per repo",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1080,
+        300
+      ],
+      "onError": "continueRegularOutput",
+      "credentials": {
+        "httpHeaderAuth": {
+          "name": "Gitea (admin) — Bearer"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// n8n's HTTP Request node auto-splits array responses, so each item\n// here is a SINGLE commit object (not an array of commits per repo).\n// Group by repo, filter on date, then render.\nconst cutoff = Date.now() - 24*60*60*1000;\nconst byRepo = {};\n\nfor (const item of $input.all()) {\n  const c = item.json;\n  if (!c || c.error) continue;\n  const dateStr = c.created || c.commit?.author?.date;\n  if (!dateStr) continue;\n  if (new Date(dateStr).getTime() < cutoff) continue;\n  // Resolve repo name: prefer .repository.full_name, fall back to URL parse\n  let repoName = c.repository?.full_name;\n  if (!repoName) {\n    const m = (c.url || '').match(/\\/api\\/v1\\/repos\\/([^\\/]+)\\/([^\\/]+)\\//);\n    if (m) repoName = `${m[1]}/${m[2]}`;\n  }\n  if (!repoName) repoName = 'unknown';\n  (byRepo[repoName] = byRepo[repoName] || []).push(c);\n}\n\nconst lines = [];\nlet repoCount = 0;\nlet commitCount = 0;\nfor (const [repoName, commits] of Object.entries(byRepo)) {\n  repoCount++;\n  lines.push(`**${repoName}** (${commits.length} commit${commits.length>1?'s':''})`);\n  for (const c of commits.slice(0, 5)) {\n    const msg = (c.commit?.message || c.message || '').split('\\n')[0].slice(0, 90);\n    const who = c.commit?.author?.name || c.author?.login || 'unknown';\n    lines.push(`  • ${msg} — _${who}_`);\n    commitCount++;\n  }\n  if (commits.length > 5) lines.push(`  • …and ${commits.length-5} more`);\n}\n\nlet text;\nif (!lines.length) {\n  text = ':sleeping: No Gitea activity in the last 24 hours.';\n} else {\n  text = `:newspaper: **Daily Gitea digest** — ${commitCount} commits across ${repoCount} repo${repoCount>1?'s':''}\\n\\n${lines.join('\\n')}`;\n}\n\nreturn [{json: {text}}];"
+      },
+      "id": "bbbbbbbb-5555-5555-5555-bbbbbbbbbbbb",
+      "name": "Format digest",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1360,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "resource": "message",
+        "operation": "post",
+        "channelId": "town-square",
+        "message": "={{$json.text}}"
+      },
+      "id": "bbbbbbbb-6666-6666-6666-bbbbbbbbbbbb",
+      "name": "Post to Mattermost",
+      "type": "n8n-nodes-base.mattermost",
+      "typeVersion": 1,
+      "position": [
+        1640,
+        300
+      ],
+      "credentials": {
+        "mattermostApi": {
+          "name": "Mattermost (pi-bot)"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Daily 9am": {
+      "main": [
+        [
+          {
+            "node": "List Gitea repos",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "List Gitea repos": {
+      "main": [
+        [
+          {
+            "node": "Filter recent",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Filter recent": {
+      "main": [
+        [
+          {
+            "node": "Fetch commits per repo",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch commits per repo": {
+      "main": [
+        [
+          {
+            "node": "Format digest",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format digest": {
+      "main": [
+        [
+          {
+            "node": "Post to Mattermost",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "tags": [
+    "td-proxmox",
+    "starter",
+    "scheduled"
+  ],
+  "meta": {
+    "description": "Cron 9am daily → list Gitea repos updated in last 24h → fetch their commits → post a digest in Mattermost #town-square. Uses an HTTP Header Auth credential named 'Gitea (admin) — Bearer' because n8n's native Gitea node is search/repo focused and the Gitea PAT works as 'Authorization: token <PAT>' on any endpoint. If you want a different cadence, edit the schedule trigger expression.",
+    "stack_dependencies": {
+      "required_apps": [
+        "mattermost",
+        "n8n",
+        "gitea"
+      ],
+      "optional_apps": [],
+      "required_features": []
+    },
+    "addon_dependencies": [
+      "setup-mattermost"
+    ]
+  }
+}

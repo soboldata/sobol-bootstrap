@@ -1,0 +1,10 @@
+--- /tmp/package/dist/core/message-router.js	1985-10-26 08:15:00.000000000 +0000
++++ /root/.pi/agent/npm/node_modules/@whonixnetworks/pi-mattermost/dist/core/message-router.js	2026-06-14 04:38:52.353270061 +0000
+@@ -2,6 +2,7 @@
+ import { logger } from "../utils/logger.js";
+ export function setupMessageRouter(ctx) {
+     ctx.ws.addMessageListener((msg) => {
++        logger.debug("WS event received", { event: msg.event, hasData: !!msg.data });
+         if (msg.event !== "posted")
+             return;
+         const data = msg.data;

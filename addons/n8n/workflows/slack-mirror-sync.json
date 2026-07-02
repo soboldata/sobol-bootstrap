@@ -1,0 +1,485 @@
+{
+  "name": "Slack mirror sync (Sobol Mirror)",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 * * * *"
+            }
+          ]
+        }
+      },
+      "id": "ssssss01-1111-1111-1111-ssssssssssss",
+      "name": "Hourly cron",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        240,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Read sync cursor from postgres so we know the last successful sync time.\n// Output the cursor + workspace metadata for downstream nodes.\nconst pgItems = $('Read sync state').all();\nconst cursors = {};\nfor (const it of pgItems) {\n  cursors[it.json.entity] = it.json.cursor || null;\n}\n\n// First-run backfill window — read from a workflow variable if set, else default 30 days\nconst backfillDays = parseInt($env.SLACK_BACKFILL_DAYS || '30', 10);\nconst now = Math.floor(Date.now() / 1000);\nconst defaultOldest = now - (backfillDays * 86400);\n\nreturn [{\n  json: {\n    cursors,\n    now,\n    default_oldest: defaultOldest,\n    backfill_days: backfillDays\n  }\n}];"
+      },
+      "id": "ssssss02-1111-1111-1111-ssssssssssss",
+      "name": "Compute window",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        800,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT entity, cursor, last_sync_ts FROM _meta.sync_state WHERE source = 'slack';",
+        "options": {}
+      },
+      "id": "ssssss03-1111-1111-1111-ssssssssssss",
+      "name": "Read sync state",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        520,
+        300
+      ],
+      "credentials": {
+        "postgres": {
+          "name": "Sobol Mirror (writer)"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "url": "https://slack.com/api/conversations.list",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "types",
+              "value": "public_channel,private_channel"
+            },
+            {
+              "name": "exclude_archived",
+              "value": "false"
+            },
+            {
+              "name": "limit",
+              "value": "200"
+            }
+          ]
+        },
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "httpHeaderAuth",
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "json"
+            }
+          }
+        }
+      },
+      "id": "ssssss04-1111-1111-1111-ssssssssssss",
+      "name": "List channels",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1080,
+        200
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "name": "Slack (Sobol Sync) — Bearer"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "url": "https://slack.com/api/users.list",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "limit",
+              "value": "200"
+            }
+          ]
+        },
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "httpHeaderAuth",
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "json"
+            }
+          }
+        }
+      },
+      "id": "ssssss05-1111-1111-1111-ssssssssssss",
+      "name": "List users",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1080,
+        400
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "name": "Slack (Sobol Sync) — Bearer"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Upsert channels and users into postgres. We do it in JS so we can build\n// parameterized SQL safely (Slack channel names/users may contain quotes).\nconst channels = ($json.channels || []).filter(c => !c.is_im && !c.is_mpim);\nconst out = [];\nfor (const c of channels) {\n  out.push({\n    json: {\n      id: c.id,\n      name: c.name || '(unnamed)',\n      is_archived: !!c.is_archived,\n      is_private: !!c.is_private,\n      is_im: !!c.is_im,\n      is_mpim: !!c.is_mpim,\n      num_members: c.num_members || 0,\n      purpose: (c.purpose && c.purpose.value) || null,\n      topic: (c.topic && c.topic.value) || null,\n      created_unix: c.created || null\n    }\n  });\n}\nreturn out;"
+      },
+      "id": "ssssss06-1111-1111-1111-ssssssssssss",
+      "name": "Format channels",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1360,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const users = ($json.members || []);\nconst out = [];\nfor (const u of users) {\n  const p = u.profile || {};\n  out.push({\n    json: {\n      id: u.id,\n      name: u.name || null,\n      real_name: u.real_name || p.real_name || null,\n      display_name: p.display_name || null,\n      email: p.email || null,\n      is_bot: !!u.is_bot,\n      is_admin: !!u.is_admin,\n      is_deleted: !!u.deleted,\n      tz: u.tz || null\n    }\n  });\n}\nreturn out;"
+      },
+      "id": "ssssss07-1111-1111-1111-ssssssssssss",
+      "name": "Format users",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1360,
+        400
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO slack.channels (id, name, is_archived, is_private, is_im, is_mpim, num_members, purpose, topic, created_unix)\nVALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)\nON CONFLICT (id) DO UPDATE SET\n  name = EXCLUDED.name,\n  is_archived = EXCLUDED.is_archived,\n  is_private = EXCLUDED.is_private,\n  num_members = EXCLUDED.num_members,\n  purpose = EXCLUDED.purpose,\n  topic = EXCLUDED.topic,\n  synced_at = NOW();",
+        "options": {
+          "queryReplacement": "={{$json.id}},{{$json.name}},{{$json.is_archived}},{{$json.is_private}},{{$json.is_im}},{{$json.is_mpim}},{{$json.num_members}},{{$json.purpose}},{{$json.topic}},{{$json.created_unix}}"
+        }
+      },
+      "id": "ssssss08-1111-1111-1111-ssssssssssss",
+      "name": "Upsert channels",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1640,
+        200
+      ],
+      "credentials": {
+        "postgres": {
+          "name": "Sobol Mirror (writer)"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO slack.users (id, name, real_name, display_name, email, is_bot, is_admin, is_deleted, tz)\nVALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)\nON CONFLICT (id) DO UPDATE SET\n  name = EXCLUDED.name,\n  real_name = EXCLUDED.real_name,\n  display_name = EXCLUDED.display_name,\n  email = EXCLUDED.email,\n  is_bot = EXCLUDED.is_bot,\n  is_admin = EXCLUDED.is_admin,\n  is_deleted = EXCLUDED.is_deleted,\n  synced_at = NOW();",
+        "options": {
+          "queryReplacement": "={{$json.id}},{{$json.name}},{{$json.real_name}},{{$json.display_name}},{{$json.email}},{{$json.is_bot}},{{$json.is_admin}},{{$json.is_deleted}},{{$json.tz}}"
+        }
+      },
+      "id": "ssssss09-1111-1111-1111-ssssssssssss",
+      "name": "Upsert users",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1640,
+        400
+      ],
+      "credentials": {
+        "postgres": {
+          "name": "Sobol Mirror (writer)"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Build a list of {channel_id, oldest_ts} pairs to fetch messages for.\n// For each non-archived public/private channel, we'll fetch its messages.\n//\n// The cursor for messages is per-channel: last successfully-fetched ts.\n// For v1 we use a single global cursor in _meta.sync_state to keep things\n// simple; per-channel cursors are a v2 refinement.\nconst channels = $('Format channels').all().map(i => i.json).filter(c => !c.is_archived);\nconst computeOutput = $('Compute window').first().json;\nconst cursor = (computeOutput.cursors && computeOutput.cursors.messages) || null;\nconst oldest = cursor || computeOutput.default_oldest;\n\nconst out = [];\nfor (const c of channels) {\n  out.push({\n    json: {\n      channel_id: c.id,\n      channel_name: c.name,\n      oldest: oldest,\n      latest: computeOutput.now\n    }\n  });\n}\nreturn out;"
+      },
+      "id": "ssssss10-1111-1111-1111-ssssssssssss",
+      "name": "Plan message fetches",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1920,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "url": "=https://slack.com/api/conversations.history",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "channel",
+              "value": "={{$json.channel_id}}"
+            },
+            {
+              "name": "oldest",
+              "value": "={{$json.oldest}}"
+            },
+            {
+              "name": "latest",
+              "value": "={{$json.latest}}"
+            },
+            {
+              "name": "limit",
+              "value": "200"
+            }
+          ]
+        },
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "httpHeaderAuth",
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "json"
+            }
+          }
+        }
+      },
+      "id": "ssssss11-1111-1111-1111-ssssssssssss",
+      "name": "Fetch channel history",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2200,
+        300
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "name": "Slack (Sobol Sync) — Bearer"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Flatten conversations.history response into per-message rows.\n// Note: $json here is one channel's response; messages is an array.\nconst channel_id = $('Plan message fetches').item.json.channel_id;\nconst messages = $json.messages || [];\nconst out = [];\nfor (const m of messages) {\n  // Skip bot status / system messages we don't care about for digests\n  if (m.subtype && ['channel_join','channel_leave','channel_topic','channel_purpose'].includes(m.subtype)) {\n    continue;\n  }\n  out.push({\n    json: {\n      ts: m.ts,\n      channel_id,\n      user_id: m.user || (m.bot_id ? null : null),\n      text: m.text || '',\n      thread_ts: m.thread_ts || null,\n      reply_count: m.reply_count || 0,\n      reactions: m.reactions ? JSON.stringify(m.reactions) : null,\n      files: m.files ? JSON.stringify(m.files) : null,\n      message_type: m.type || 'message',\n      subtype: m.subtype || null,\n      edited_ts: (m.edited && m.edited.ts) || null\n    }\n  });\n}\nreturn out;"
+      },
+      "id": "ssssss12-1111-1111-1111-ssssssssssss",
+      "name": "Format messages",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2480,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO slack.messages (ts, channel_id, user_id, text, thread_ts, reply_count, reactions, files, message_type, subtype, edited_ts)\nVALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8::jsonb, $9, $10, $11)\nON CONFLICT (ts, channel_id) DO UPDATE SET\n  text = EXCLUDED.text,\n  reactions = EXCLUDED.reactions,\n  reply_count = EXCLUDED.reply_count,\n  edited_ts = EXCLUDED.edited_ts,\n  synced_at = NOW();",
+        "options": {
+          "queryReplacement": "={{$json.ts}},{{$json.channel_id}},{{$json.user_id}},{{$json.text}},{{$json.thread_ts}},{{$json.reply_count}},{{$json.reactions}},{{$json.files}},{{$json.message_type}},{{$json.subtype}},{{$json.edited_ts}}"
+        }
+      },
+      "id": "ssssss13-1111-1111-1111-ssssssssssss",
+      "name": "Upsert messages",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        2760,
+        300
+      ],
+      "credentials": {
+        "postgres": {
+          "name": "Sobol Mirror (writer)"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE _meta.sync_state\nSET cursor = $1,\n    last_sync_ts = NOW(),\n    last_status = 'ok',\n    last_error = NULL,\n    rows_total = rows_total + COALESCE($2, 0)\nWHERE source = 'slack' AND entity IN ('messages', 'channels', 'users');",
+        "options": {
+          "queryReplacement": "={{$('Compute window').first().json.now}},{{$('Format messages').all().length}}"
+        }
+      },
+      "id": "ssssss14-1111-1111-1111-ssssssssssss",
+      "name": "Update sync state",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        3040,
+        300
+      ],
+      "credentials": {
+        "postgres": {
+          "name": "Sobol Mirror (writer)"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Hourly cron": {
+      "main": [
+        [
+          {
+            "node": "Read sync state",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read sync state": {
+      "main": [
+        [
+          {
+            "node": "Compute window",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Compute window": {
+      "main": [
+        [
+          {
+            "node": "List channels",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "List users",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "List channels": {
+      "main": [
+        [
+          {
+            "node": "Format channels",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "List users": {
+      "main": [
+        [
+          {
+            "node": "Format users",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format channels": {
+      "main": [
+        [
+          {
+            "node": "Upsert channels",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Plan message fetches",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format users": {
+      "main": [
+        [
+          {
+            "node": "Upsert users",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Plan message fetches": {
+      "main": [
+        [
+          {
+            "node": "Fetch channel history",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch channel history": {
+      "main": [
+        [
+          {
+            "node": "Format messages",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format messages": {
+      "main": [
+        [
+          {
+            "node": "Upsert messages",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Upsert messages": {
+      "main": [
+        [
+          {
+            "node": "Update sync state",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "tags": [
+    "sobol-mirror",
+    "connector",
+    "slack",
+    "starter"
+  ],
+  "meta": {
+    "description": "Hourly Slack mirror sync for Sobol Mirror. Reads conversations.list + users.list + conversations.history for each non-archived channel, upserts into slack.channels/users/messages in the sobol_mirror Postgres DB. Imported but inactive — operator activates after binding Postgres credentials ('Sobol Mirror (writer)') and providing SLACK_BOT_TOKEN env var to n8n. First run with backfill_days=30 (configurable via SLACK_BACKFILL_DAYS env var) pulls ~30 days of history; subsequent runs use cursor from _meta.sync_state for incremental. See repo/addons/setup-connector-slack.sh for setup details. Companion: comms-agent persona reads from agent_view.slack_* views populated by this data.",
+    "stack_dependencies": {
+      "required_apps": [
+        "n8n",
+        "postgres-mirror",
+        "connector-slack"
+      ],
+      "optional_apps": [],
+      "required_features": []
+    },
+    "addon_dependencies": [
+      "setup-postgres-mirror",
+      "setup-connector-slack"
+    ]
+  }
+}

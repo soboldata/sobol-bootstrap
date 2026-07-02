@@ -1,0 +1,199 @@
+{
+  "name": "Postmark events → Mattermost #bot",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "postmark-events",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "dddddddd-1111-1111-1111-dddddddddddd",
+      "name": "Postmark webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        240,
+        300
+      ],
+      "webhookId": "td-postmark-events"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Postmark fires this webhook on bounce / spam-complaint / open / click /\n// delivery / subscription events. We filter to the operationally-important\n// ones: bounce, spam complaint, transient (deferred), and link-broken.\n//\n// Payload shape (Postmark v1 webhook format):\n//   RecordType: 'Bounce' | 'SpamComplaint' | 'Delivery' | 'Open' | 'Click' | 'SubscriptionChange'\n//   Type: 'HardBounce' | 'SoftBounce' | 'Transient' | ...\n//   Email: recipient\n//   Subject: original message subject\n//   From: sender\n//   BouncedAt / SpamComplaintAt: timestamp\n//   Description: human-readable error\n//   Details: technical error\n//\n// See https://postmarkapp.com/developer/webhooks for full schema.\n\nconst body = $json.body || {};\nconst recordType = (body.RecordType || '').toLowerCase();\n\nlet text = null;\n\nif (recordType === 'bounce') {\n  const bounceType = body.Type || 'Bounce';\n  const isHard = bounceType.toLowerCase().includes('hard');\n  const emoji = isHard ? ':x:' : ':warning:';\n  const recip = body.Email || 'unknown';\n  const subj = (body.Subject || '(no subject)').slice(0, 80);\n  const when = body.BouncedAt || new Date().toISOString();\n  const desc = (body.Description || body.Details || 'no description').slice(0, 200);\n  text = `${emoji} **Postmark: ${bounceType}**\\n` +\n         `  Recipient: \\`${recip}\\`\\n` +\n         `  Subject: ${subj}\\n` +\n         `  When: ${when}\\n` +\n         `  Reason: ${desc}`;\n  if (isHard) {\n    text += `\\n  :information_source: Hard bounce — Postmark has marked this address inactive. To unblock, visit Postmark → Servers → your-server → Activity → search the address → Reactivate.`;\n  }\n} else if (recordType === 'spamcomplaint') {\n  const recip = body.Email || 'unknown';\n  const subj = (body.Subject || '(no subject)').slice(0, 80);\n  const when = body.SpamComplaintAt || new Date().toISOString();\n  text = `:no_entry: **Postmark: Spam complaint**\\n` +\n         `  Recipient: \\`${recip}\\`\\n` +\n         `  Subject: ${subj}\\n` +\n         `  When: ${when}\\n` +\n         `  :warning: This recipient has reported your mail as spam. Postmark has suppressed future sends to this address. Investigate why — wrong list, bad content, or compromised sender?`;\n} else if (recordType === 'subscriptionchange') {\n  const recip = body.Recipient || body.Email || 'unknown';\n  const supp = body.SuppressionReason || 'unknown reason';\n  text = `:bell: **Postmark: Subscription change**\\n` +\n         `  Recipient: \\`${recip}\\`\\n` +\n         `  Reason: ${supp}`;\n}\n// We intentionally don't post for 'Delivery' (every successful send would\n// flood the channel) or 'Open'/'Click' (high-volume tracking events).\n\nif (!text) return [{ json: { skip: true, recordType } }];\nreturn [{ json: { text, recordType } }];"
+      },
+      "id": "dddddddd-2222-2222-2222-dddddddddddd",
+      "name": "Format event",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        520,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose"
+          },
+          "conditions": [
+            {
+              "id": "skip-check",
+              "leftValue": "={{$json.skip}}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "false",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "dddddddd-3333-3333-3333-dddddddddddd",
+      "name": "Should we post?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        800,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "resource": "message",
+        "operation": "post",
+        "channelId": "=bot",
+        "message": "={{$json.text}}"
+      },
+      "id": "dddddddd-4444-4444-4444-dddddddddddd",
+      "name": "Post to Mattermost",
+      "type": "n8n-nodes-base.mattermost",
+      "typeVersion": 1,
+      "position": [
+        1080,
+        220
+      ],
+      "credentials": {
+        "mattermostApi": {
+          "name": "Mattermost (pi-bot)"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={\n  \"ok\": true,\n  \"posted\": true,\n  \"recordType\": {{JSON.stringify($json.recordType || 'unknown')}}\n}",
+        "options": {}
+      },
+      "id": "dddddddd-5555-5555-5555-dddddddddddd",
+      "name": "Respond (posted)",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [
+        1360,
+        220
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={\n  \"ok\": true,\n  \"posted\": false,\n  \"recordType\": {{JSON.stringify($json.recordType || 'unknown')}},\n  \"reason\": \"event ignored (delivery/open/click etc are high-volume — skipped)\"\n}",
+        "options": {}
+      },
+      "id": "dddddddd-6666-6666-6666-dddddddddddd",
+      "name": "Respond (skipped)",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [
+        1080,
+        420
+      ]
+    }
+  ],
+  "connections": {
+    "Postmark webhook": {
+      "main": [
+        [
+          {
+            "node": "Format event",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format event": {
+      "main": [
+        [
+          {
+            "node": "Should we post?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Should we post?": {
+      "main": [
+        [
+          {
+            "node": "Post to Mattermost",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond (skipped)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Post to Mattermost": {
+      "main": [
+        [
+          {
+            "node": "Respond (posted)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "tags": [
+    "td-proxmox",
+    "starter",
+    "postmark",
+    "mattermost"
+  ],
+  "meta": {
+    "description": "Receives Postmark webhook events at POST /webhook/postmark-events and posts the operationally-important ones (Bounce, SpamComplaint, SubscriptionChange) to Mattermost #bot. Filters out high-volume events (Delivery, Open, Click) to avoid channel spam. To wire up: Postmark dashboard → your server → Settings → Webhooks → Add Webhook → URL: http://n8n:5678/webhook/postmark-events (or use the public CF-tunneled URL if your n8n isn't reachable from Postmark's network). Check the events you want to receive: Bounce, Spam Complaint, Subscription Change. Save. From then on, every bounce / spam complaint / unsubscribe lands in #bot.",
+    "stack_dependencies": {
+      "required_apps": [
+        "mattermost",
+        "n8n"
+      ],
+      "optional_apps": [],
+      "required_features": [
+        "email_relay"
+      ]
+    },
+    "addon_dependencies": [
+      "setup-mattermost",
+      "setup-pve-email"
+    ]
+  }
+}

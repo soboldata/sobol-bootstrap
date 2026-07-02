@@ -1,0 +1,197 @@
+{
+  "name": "Gitea events → Mattermost",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "gitea-events",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "cccccccc-1111-1111-1111-cccccccccccc",
+      "name": "Gitea webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        240,
+        300
+      ],
+      "webhookId": "td-gitea-events"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Route any Gitea system-webhook event to a Mattermost-friendly message.\n// Returns {text} for events worth posting, {skip:true} for events to ignore.\n// Distinguishes events by the X-Gitea-Event header (passed by Gitea on every\n// webhook POST). Body shapes vary per event — see\n// https://docs.gitea.com/development/webhooks for the per-event payloads.\n\nconst headers = $json.headers || {};\nconst body = $json.body || {};\nconst eventType = (headers['x-gitea-event'] || '').toLowerCase();\n\nlet text = null;\n\nswitch (eventType) {\n  case 'push': {\n    const repo = body.repository?.full_name || 'unknown';\n    const pusher = body.pusher?.username || body.sender?.username || 'someone';\n    const ref = (body.ref || '').replace('refs/heads/', '').replace('refs/tags/', 'tag:');\n    const commits = body.commits || [];\n    if (!commits.length) break;\n    const lines = [`:arrow_up: **${pusher}** pushed ${commits.length} commit${commits.length>1?'s':''} to **${repo}** (\\`${ref}\\`)`];\n    for (const c of commits.slice(0, 5)) {\n      const msg = (c.message || '').split('\\n')[0].slice(0, 90);\n      const sha = (c.id || '').slice(0, 7);\n      lines.push(`  • [\\`${sha}\\`](${c.url}) ${msg}`);\n    }\n    if (commits.length > 5) lines.push(`  • …and ${commits.length-5} more`);\n    text = lines.join('\\n');\n    break;\n  }\n  case 'pull_request': {\n    const pr = body.pull_request || {};\n    const action = body.action || 'updated';\n    const repo = body.repository?.full_name || 'unknown';\n    const user = body.sender?.username || pr.user?.username || 'someone';\n    const num = pr.number;\n    const title = pr.title || '';\n    const url = pr.html_url || pr.url || '';\n    let emoji, verb;\n    if (action === 'opened')   { emoji = ':rocket:'; verb = 'opened'; }\n    else if (action === 'closed' && pr.merged) { emoji = ':white_check_mark:'; verb = 'merged'; }\n    else if (action === 'closed') { emoji = ':x:'; verb = 'closed (without merging)'; }\n    else if (action === 'reopened') { emoji = ':leftwards_arrow_with_hook:'; verb = 'reopened'; }\n    else break; // ignore edit/assign/etc.\n    text = `${emoji} **${user}** ${verb} PR [#${num}: ${title}](${url}) in **${repo}**`;\n    break;\n  }\n  case 'pull_request_review': {\n    const pr = body.pull_request || {};\n    const review = body.review || {};\n    const repo = body.repository?.full_name || 'unknown';\n    const user = body.sender?.username || 'someone';\n    const num = pr.number;\n    const title = pr.title || '';\n    const url = pr.html_url || pr.url || '';\n    const state = (review.state || '').toLowerCase();\n    let emoji;\n    if (state === 'approved') emoji = ':+1:';\n    else if (state === 'rejected' || state === 'request_changes') emoji = ':warning:';\n    else if (state === 'commented') emoji = ':speech_balloon:';\n    else break;\n    text = `${emoji} **${user}** reviewed PR [#${num}: ${title}](${url}) (${state}) in **${repo}**`;\n    break;\n  }\n  case 'issues': {\n    const issue = body.issue || {};\n    const action = body.action || 'updated';\n    const repo = body.repository?.full_name || 'unknown';\n    const user = body.sender?.username || issue.user?.username || 'someone';\n    const num = issue.number;\n    const title = issue.title || '';\n    const url = issue.html_url || issue.url || '';\n    let emoji, verb;\n    if (action === 'opened')   { emoji = ':bug:'; verb = 'opened'; }\n    else if (action === 'closed') { emoji = ':checkered_flag:'; verb = 'closed'; }\n    else if (action === 'reopened') { emoji = ':leftwards_arrow_with_hook:'; verb = 'reopened'; }\n    else break;\n    text = `${emoji} **${user}** ${verb} issue [#${num}: ${title}](${url}) in **${repo}**`;\n    break;\n  }\n  case 'issue_comment': {\n    const issue = body.issue || {};\n    const comment = body.comment || {};\n    const action = body.action || '';\n    if (action !== 'created') break;\n    const repo = body.repository?.full_name || 'unknown';\n    const user = body.sender?.username || 'someone';\n    const num = issue.number;\n    const title = issue.title || '';\n    const url = comment.html_url || issue.html_url || '';\n    const snippet = (comment.body || '').split('\\n')[0].slice(0, 100);\n    text = `:speech_balloon: **${user}** commented on [#${num}: ${title}](${url}) in **${repo}**` +\n           (snippet ? `\\n  > ${snippet}` : '');\n    break;\n  }\n  case 'release': {\n    const rel = body.release || {};\n    const action = body.action || '';\n    if (action !== 'published') break;\n    const repo = body.repository?.full_name || 'unknown';\n    const user = body.sender?.username || rel.author?.username || 'someone';\n    const tag = rel.tag_name || 'untagged';\n    const name = rel.name || tag;\n    const url = rel.html_url || rel.url || '';\n    text = `:tada: **${user}** published [${name}](${url}) (${tag}) in **${repo}**`;\n    break;\n  }\n  case 'create': {\n    const repo = body.repository?.full_name || 'unknown';\n    const user = body.sender?.username || 'someone';\n    const refType = body.ref_type || 'ref';\n    const ref = body.ref || '';\n    if (refType === 'branch') {\n      text = `:herb: **${user}** created branch \\`${ref}\\` in **${repo}**`;\n    } else if (refType === 'tag') {\n      text = `:label: **${user}** tagged \\`${ref}\\` in **${repo}**`;\n    }\n    break;\n  }\n  case 'repository': {\n    const action = body.action || '';\n    const repo = body.repository?.full_name || 'unknown';\n    const user = body.sender?.username || 'someone';\n    if (action === 'created') text = `:sparkles: **${user}** created new repo **${repo}**`;\n    else if (action === 'deleted') text = `:wastebasket: **${user}** deleted repo **${repo}**`;\n    break;\n  }\n  case 'fork': {\n    const repo = body.repository?.full_name || 'unknown';\n    const forkee = body.forkee?.full_name || 'unknown';\n    const user = body.sender?.username || 'someone';\n    text = `:fork_and_knife: **${user}** forked **${repo}** → **${forkee}**`;\n    break;\n  }\n}\n\nif (!text) return [{ json: { skip: true, eventType } }];\nreturn [{ json: { text, eventType } }];"
+      },
+      "id": "cccccccc-2222-2222-2222-cccccccccccc",
+      "name": "Format event",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        520,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose"
+          },
+          "conditions": [
+            {
+              "id": "skip-check",
+              "leftValue": "={{$json.skip}}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "false",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "cccccccc-3333-3333-3333-cccccccccccc",
+      "name": "Should we post?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        800,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "resource": "message",
+        "operation": "post",
+        "channelId": "town-square",
+        "message": "={{$json.text}}"
+      },
+      "id": "cccccccc-4444-4444-4444-cccccccccccc",
+      "name": "Post to Mattermost",
+      "type": "n8n-nodes-base.mattermost",
+      "typeVersion": 1,
+      "position": [
+        1080,
+        220
+      ],
+      "credentials": {
+        "mattermostApi": {
+          "name": "Mattermost (pi-bot)"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={\n  \"ok\": true,\n  \"posted\": true,\n  \"event\": {{JSON.stringify($json.eventType || 'unknown')}}\n}",
+        "options": {}
+      },
+      "id": "cccccccc-5555-5555-5555-cccccccccccc",
+      "name": "Respond (posted)",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [
+        1360,
+        220
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={\n  \"ok\": true,\n  \"posted\": false,\n  \"event\": {{JSON.stringify($json.eventType || 'unknown')}},\n  \"reason\": \"event ignored\"\n}",
+        "options": {}
+      },
+      "id": "cccccccc-6666-6666-6666-cccccccccccc",
+      "name": "Respond (skipped)",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [
+        1080,
+        420
+      ]
+    }
+  ],
+  "connections": {
+    "Gitea webhook": {
+      "main": [
+        [
+          {
+            "node": "Format event",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format event": {
+      "main": [
+        [
+          {
+            "node": "Should we post?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Should we post?": {
+      "main": [
+        [
+          {
+            "node": "Post to Mattermost",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond (skipped)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Post to Mattermost": {
+      "main": [
+        [
+          {
+            "node": "Respond (posted)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "tags": [
+    "td-proxmox",
+    "starter",
+    "gitea",
+    "mattermost"
+  ],
+  "meta": {
+    "description": "Receives Gitea system webhook events at POST /webhook/gitea-events and posts a formatted Mattermost message for push, PR opened/closed/merged/reopened, PR review (approve/reject), issue opened/closed/reopened, issue comments, releases, branch/tag create, repo create/delete, and forks. To wire up: in Gitea as admin, Site Administration → Webhooks → Add Webhook (Gitea). URL: http://n8n:5678/webhook/gitea-events. HTTP Method: POST. Content Type: application/json. Trigger On: 'Send Everything' (or pick specific events). Active: yes. Default destination channel is town-square — edit the Mattermost node's channelId to route elsewhere.",
+    "stack_dependencies": {
+      "required_apps": [
+        "mattermost",
+        "n8n",
+        "gitea"
+      ],
+      "optional_apps": [],
+      "required_features": []
+    },
+    "addon_dependencies": [
+      "setup-mattermost"
+    ]
+  }
+}

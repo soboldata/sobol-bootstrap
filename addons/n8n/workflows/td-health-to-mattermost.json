@@ -1,0 +1,200 @@
+{
+  "name": "TD Health watchdog → Mattermost",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "td-health",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "eeeeeeee-1111-1111-1111-eeeeeeeeeeee",
+      "name": "Health webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        240,
+        300
+      ],
+      "webhookId": "td-health-watchdog"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Receives the watchdog's payload on every hourly run + once at 09:00\n// heartbeat. Classify, format, and decide whether to post:\n//\n//   mode=heartbeat, active=0   → ✅ green heartbeat (daily 'still alive')\n//   mode=heartbeat, active>0   → ⚠️  yellow 'N alerts still firing'\n//   mode=incremental, new>0    → 🚨 red 'new alert(s) firing'\n//   mode=incremental, cleared>0→ ✅ green 'N alert(s) cleared'\n//   anything else              → skip (don't spam channel every hour)\n//\n// Payload shape (from /usr/local/bin/td-health-check):\n//   host, timestamp, mode, new_alerts[], cleared_alerts[],\n//   active_alerts[], healthy_checks[], active_count, new_count, cleared_count\n\nconst body = $json.body || {};\nconst host = body.host || 'unknown';\nconst ts = body.timestamp || new Date().toISOString();\nconst mode = body.mode || 'incremental';\nconst newAlerts = body.new_alerts || [];\nconst clearedAlerts = body.cleared_alerts || [];\nconst activeAlerts = body.active_alerts || [];\nconst healthy = body.healthy_checks || [];\nconst activeCount = body.active_count || 0;\nconst newCount = body.new_count || 0;\nconst clearedCount = body.cleared_count || 0;\n\nconst fmtTime = (iso) => {\n  try {\n    const d = new Date(iso);\n    return d.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', timeZoneName: 'short' });\n  } catch { return iso; }\n};\n\nconst fmtHealthyList = (items) => {\n  if (!items || items.length === 0) return '_(none reported)_';\n  return items.map(h => `  ✓ ${h}`).join('\\n');\n};\n\nlet text = null;\nlet channel = 'bot';  // patched at import time by setup-n8n.sh if you want a different channel\n\nif (mode === 'heartbeat') {\n  if (activeCount === 0) {\n    text = `:white_check_mark: **${host}** — daily heartbeat, all systems green @ ${fmtTime(ts)}\\n\\n` +\n           `**Checks passing:**\\n${fmtHealthyList(healthy)}\\n\\n` +\n           `_Next heartbeat tomorrow at 09:00 local._`;\n  } else {\n    text = `:warning: **${host}** — daily status, ${activeCount} alert(s) still firing @ ${fmtTime(ts)}\\n\\n` +\n           `**Currently firing:** ${activeAlerts.join(', ')}\\n\\n` +\n           `**Checks passing:**\\n${fmtHealthyList(healthy)}\\n\\n` +\n           `_Run \\`/usr/local/bin/td-health-check\\` on the PVE host for details._`;\n  }\n} else if (mode === 'incremental') {\n  if (newCount > 0) {\n    const bullets = newAlerts.map(a => `  • **${a.key}** — ${a.message}`).join('\\n');\n    text = `:rotating_light: **${host}** — ${newCount} new alert(s) @ ${fmtTime(ts)}\\n\\n${bullets}`;\n    if (activeCount > newCount) {\n      text += `\\n\\n_(${activeCount - newCount} other alert(s) still firing from before — see daily heartbeat for full status.)_`;\n    }\n  } else if (clearedCount > 0) {\n    text = `:white_check_mark: **${host}** — ${clearedCount} alert(s) cleared @ ${fmtTime(ts)}\\n\\n` +\n           `**Resolved:** ${clearedAlerts.join(', ')}\\n\\n` +\n           (activeCount > 0\n             ? `_(${activeCount} other alert(s) still firing — daily heartbeat will summarize.)_`\n             : `_All clear._`);\n  }\n}\n\n// If text is still null, the hour was quiet: no new alerts, no clears, not\n// heartbeat. Skip the post entirely so the channel doesn't get \"all good\"\n// pings every hour — that's what the daily 09:00 heartbeat is for.\nif (!text) {\n  return [{ json: { skip: true, reason: 'no-change', mode, activeCount } }];\n}\n\nreturn [{ json: { skip: false, text, channel, mode, host, ts } }];"
+      },
+      "id": "eeeeeeee-2222-2222-2222-eeeeeeeeeeee",
+      "name": "Classify + format",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        520,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose"
+          },
+          "conditions": [
+            {
+              "id": "skip-gate",
+              "leftValue": "={{$json.skip}}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "false",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "eeeeeeee-3333-3333-3333-eeeeeeeeeeee",
+      "name": "Should we post?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        800,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "resource": "message",
+        "operation": "post",
+        "channelId": "={{$json.channel}}",
+        "message": "={{$json.text}}"
+      },
+      "id": "eeeeeeee-4444-4444-4444-eeeeeeeeeeee",
+      "name": "Post to Mattermost",
+      "type": "n8n-nodes-base.mattermost",
+      "typeVersion": 1,
+      "position": [
+        1080,
+        220
+      ],
+      "credentials": {
+        "mattermostApi": {
+          "name": "Mattermost (pi-bot)"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={\n  \"ok\": true,\n  \"posted\": true,\n  \"mode\": {{JSON.stringify($json.mode || 'unknown')}},\n  \"host\": {{JSON.stringify($json.host || 'unknown')}}\n}",
+        "options": {}
+      },
+      "id": "eeeeeeee-5555-5555-5555-eeeeeeeeeeee",
+      "name": "Respond (posted)",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [
+        1360,
+        220
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={\n  \"ok\": true,\n  \"posted\": false,\n  \"reason\": {{JSON.stringify($json.reason || 'unknown')}},\n  \"mode\": {{JSON.stringify($json.mode || 'unknown')}},\n  \"activeCount\": {{JSON.stringify($json.activeCount || 0)}}\n}",
+        "options": {}
+      },
+      "id": "eeeeeeee-6666-6666-6666-eeeeeeeeeeee",
+      "name": "Respond (skipped)",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [
+        1080,
+        420
+      ]
+    }
+  ],
+  "connections": {
+    "Health webhook": {
+      "main": [
+        [
+          {
+            "node": "Classify + format",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Classify + format": {
+      "main": [
+        [
+          {
+            "node": "Should we post?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Should we post?": {
+      "main": [
+        [
+          {
+            "node": "Post to Mattermost",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond (skipped)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Post to Mattermost": {
+      "main": [
+        [
+          {
+            "node": "Respond (posted)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "tags": [
+    "td-proxmox",
+    "starter",
+    "watchdog",
+    "mattermost",
+    "ops"
+  ],
+  "meta": {
+    "description": "Receives JSON from /usr/local/bin/td-health-check (the PVE host watchdog installed by setup-health-watchdog.sh) at POST /webhook/td-health and posts to Mattermost #bot when something changed. Hourly silent runs (no new alerts, none cleared) skip the post — only state-changes and the daily 09:00 heartbeat get through. To wire up: activate this workflow in n8n, copy the webhook URL from the trigger node, then add to /root/td-tokens.txt as MATTERMOST_WEBHOOK_URL=<url>. Then re-run ./addons/setup-health-watchdog.sh (or just /usr/local/bin/td-health-check --heartbeat) to confirm. Silent channels become a signal: if you stop seeing daily heartbeats, the watchdog itself is dead.",
+    "stack_dependencies": {
+      "required_apps": [
+        "mattermost",
+        "n8n"
+      ],
+      "optional_apps": [],
+      "required_features": [
+        "health_watchdog"
+      ]
+    },
+    "addon_dependencies": [
+      "setup-mattermost",
+      "setup-health-watchdog"
+    ]
+  }
+}

@@ -1,0 +1,117 @@
+# Slack connector manifest — reference implementation of connector-manifest-spec.md
+
+name: slack
+display_name: Slack
+version: 1.0.0
+maintainer: sobol-data
+
+source:
+  type: api
+  base_url: https://slack.com/api/
+  docs: https://api.slack.com/methods
+
+auth:
+  type: oauth2
+  oauth:
+    provider: slack
+    scopes:
+      - channels:history
+      - channels:read
+      - groups:history       # private channels — only if bot is invited
+      - groups:read
+      - users:read
+      - users:read.email
+      - reactions:read
+    refresh_token_supported: false  # Slack bot tokens don't expire by default
+
+sync:
+  cadence: hourly
+  cron_expression: "0 * * * *"
+  incremental: true
+  initial_backfill_days: 30
+
+rate_limits:
+  tier: 2
+  requests_per_minute: 20
+  backoff_strategy: exponential
+  retry_max: 5
+
+schema:
+  name: slack
+  tables:
+    - name: channels
+      primary_key: id
+      ingestion_pattern: full_replace
+      estimated_rows_per_day: 50
+    - name: users
+      primary_key: id
+      ingestion_pattern: full_replace
+      estimated_rows_per_day: 50
+    - name: messages
+      primary_key: ts
+      ingestion_pattern: upsert
+      estimated_rows_per_day: 5000
+    - name: threads
+      primary_key: parent_ts
+      ingestion_pattern: upsert
+      estimated_rows_per_day: 200
+    - name: reactions
+      primary_key: [message_ts, emoji, user_id]
+      ingestion_pattern: upsert
+      estimated_rows_per_day: 500
+
+agent_views:
+  - name: agent_view.slack_recent_24h
+    description: All messages from last 24h, with channel + user names joined in
+    consumed_by: [comms-agent]
+    columns: [channel, user_real_name, text, ts, thread_ts, reaction_count]
+
+  - name: agent_view.slack_recent_7d
+    description: Last 7 days for weekly digest
+    consumed_by: [comms-agent]
+
+  - name: agent_view.slack_channel_activity_24h
+    description: Message count + active user count per channel for yesterday
+    consumed_by: [comms-agent]
+    columns: [channel, message_count, active_user_count, top_user]
+
+  - name: agent_view.slack_threads_with_questions
+    description: Threads where OP includes "?" and no reply within 24h
+    consumed_by: [comms-agent]
+    columns: [channel, op_user, op_text, op_ts, age_hours]
+
+  - name: agent_view.slack_threads_with_decisions
+    description: Threads with decision-language keywords in OP or replies
+    consumed_by: [comms-agent]
+
+  - name: agent_view.slack_action_items
+    description: Messages matching @user can/please/could-you patterns
+    consumed_by: [comms-agent]
+    columns: [channel, assignee_user, action_text, ts]
+
+  - name: agent_view.slack_high_reaction_messages_24h
+    description: Messages with >3 reactions in last 24h
+    consumed_by: [comms-agent]
+
+  - name: agent_view.slack_quiet_users_7d
+    description: Users who used to post regularly (>5/wk) but not this week (<2)
+    consumed_by: [comms-agent]
+
+dependencies:
+  upstream:
+    - postgres-mirror
+  downstream:
+    - persona: comms-agent
+    - workflow: comms-agent-digest
+
+observability:
+  health_check_query: |
+    SELECT EXTRACT(EPOCH FROM (NOW() - last_sync_ts))/60 AS minutes_since_sync
+    FROM _meta.sync_state WHERE source = 'slack' AND entity = 'messages';
+  staleness_threshold_minutes: 90
+  watchdog_check: SLACK_SYNC_STALE
+
+capacity:
+  postgres_storage_per_year_gb: 5
+  n8n_executions_per_day: 24
+  llm_token_cost_per_day: 0

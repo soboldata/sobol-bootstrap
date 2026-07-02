@@ -1,0 +1,14 @@
+# Secrets — never commit
+*-tokens.txt
+*.env
+*.pub
+.env.*
+!.env.example
+
+# Build artifacts
+*.deb
+*.tar.gz
+
+# Local iteration
+.claude/
+.DS_Store

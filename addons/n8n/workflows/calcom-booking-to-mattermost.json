@@ -1,0 +1,131 @@
+{
+  "name": "Cal.com booking → Mattermost",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "calcom-booking",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "10101010-1010-1010-1010-101010101010",
+      "name": "Webhook (Cal.com)",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        240,
+        300
+      ],
+      "webhookId": "cs-calcom-booking"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Cal.com webhook payload shape (per Cal.com docs):\n//   {\n//     triggerEvent: 'BOOKING_CREATED' | 'BOOKING_RESCHEDULED' |\n//                   'BOOKING_CANCELLED' | 'MEETING_ENDED' | ...\n//     createdAt: ISO string,\n//     payload: {\n//       type: 'audit-consult' (the event-type slug),\n//       title: '...',\n//       description: '...',\n//       startTime: ISO,\n//       endTime: ISO,\n//       organizer: { email, name, timeZone },\n//       attendees: [{ email, name, timeZone }],\n//       location: '...',\n//       additionalNotes: '...',\n//       uid: '...',\n//     }\n//   }\n//\n// n8n's webhook node wraps this under 'body' by default.\n\nconst body = $input.first().json.body || $input.first().json;\nconst event = body?.triggerEvent || 'BOOKING';\nconst p = body?.payload || {};\n\nconst attendeeSummary = (p.attendees || [])\n  .map(a => `${a.name || '(no name)'} <${a.email || '(no email)'}>`)\n  .join(', ') || '_(no attendees)_';\n\n// Format the emoji + verb per event\nconst styles = {\n  BOOKING_CREATED:     [':spiral_calendar_pad:', 'New booking'],\n  BOOKING_RESCHEDULED: [':arrows_counterclockwise:', 'Rescheduled'],\n  BOOKING_CANCELLED:   [':x:',                     'Cancelled'],\n  MEETING_ENDED:       [':white_check_mark:',       'Meeting ended'],\n};\nconst [emoji, verb] = styles[event] || [':question:', event];\n\n// Nice human time — try to render in the organizer's TZ if provided\nconst startTime = p.startTime || '';\nconst tzHint = p.organizer?.timeZone ? ` (${p.organizer.timeZone})` : '';\n\nconst message = [\n  `${emoji} **${verb}** — *${p.title || p.type || 'booking'}*`,\n  `**When:** ${startTime}${tzHint}`,\n  p.location ? `**Where:** ${p.location}` : '',\n  `**Attendees:** ${attendeeSummary}`,\n  p.additionalNotes ? `\\n_Notes:_ ${String(p.additionalNotes).slice(0, 300)}` : '',\n  p.uid ? `\\n_uid:_ \\`${p.uid}\\`` : ''\n].filter(Boolean).join('\\n');\n\nreturn [{ json: { message, event, uid: p.uid || '', type: p.type || '' } }];"
+      },
+      "id": "20202020-2020-2020-2020-202020202020",
+      "name": "Format",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        460,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "resource": "message",
+        "operation": "post",
+        "channelId": "bot",
+        "message": "={{$json.message}}"
+      },
+      "id": "30303030-3030-3030-3030-303030303030",
+      "name": "Mattermost (pi-bot)",
+      "type": "n8n-nodes-base.mattermost",
+      "typeVersion": 1,
+      "position": [
+        720,
+        300
+      ],
+      "credentials": {
+        "mattermostApi": {
+          "name": "Mattermost (pi-bot)"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={\n  \"ok\": true,\n  \"event\": \"{{$('Format').item.json.event}}\",\n  \"uid\": \"{{$('Format').item.json.uid}}\"\n}",
+        "options": {}
+      },
+      "id": "40404040-4040-4040-4040-404040404040",
+      "name": "Respond 200",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [
+        980,
+        300
+      ]
+    }
+  ],
+  "connections": {
+    "Webhook (Cal.com)": {
+      "main": [
+        [
+          {
+            "node": "Format",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format": {
+      "main": [
+        [
+          {
+            "node": "Mattermost (pi-bot)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Mattermost (pi-bot)": {
+      "main": [
+        [
+          {
+            "node": "Respond 200",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "tags": [
+    "creator-studio",
+    "calcom"
+  ],
+  "meta": {
+    "description": "Cal.com booking webhook → format → Mattermost #bot. Handles BOOKING_CREATED / RESCHEDULED / CANCELLED / MEETING_ENDED with per-event emoji + verb. Attendee summary is de-emphasized to avoid leaking full attendee lists in busy channels. Register the webhook in Cal.com: Settings → Developer → Webhooks → New; URL = http://<n8n-ip>:5678/webhook/calcom-booking; select the trigger events you care about.\n\nAny stack composing `calcom` + `mattermost` + `n8n` can enable this.",
+    "stack_dependencies": {
+      "required_apps": [
+        "calcom",
+        "mattermost",
+        "n8n"
+      ],
+      "optional_apps": [],
+      "required_features": []
+    },
+    "addon_dependencies": [
+      "setup-calcom",
+      "setup-mattermost",
+      "setup-n8n"
+    ]
+  }
+}

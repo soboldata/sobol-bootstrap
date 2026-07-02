@@ -1,0 +1,48 @@
+--- /tmp/package/dist/extension.js	1985-10-26 08:15:00.000000000 +0000
++++ /root/.pi/agent/npm/node_modules/@whonixnetworks/pi-mattermost/dist/extension.js	2026-06-22 17:00:00.000000000 +0000
+@@ -308,6 +308,40 @@
+             ctx.ui.notify(`Disconnected from ${session.channelName}`, "info");
+         },
+     });
++    // ─── Auto-connect on session start ────────────────────────────────────
++    const autoConnect = process.env.PI_MATTERMOST_AUTO_CONNECT === "1" ||
++        process.env.PI_MATTERMOST_AUTO_CONNECT === "true";
++    if (autoConnect) {
++        pi.on("session_start", async (_event, ctx) => {
++            if (currentSession) return; // already connected
++            // ctx.cwd is "/" when pi is launched from systemd or `pct enter`
++            // directly. In that case basename(projectPath) is empty and
++            // Mattermost rejects channel creation with "Invalid or missing
++            // display_name". Fall back to /var/pi/bot so the bridge binds
++            // to the pre-created "bot" channel (pre-seeded in channel_mappings
++            // by setup-pi-mattermost-bridge.sh).
++            let projectPath = ctx.cwd;
++            if (!projectPath || projectPath === "/" || projectPath.replace(/\/+$/, "") === "") {
++                projectPath = "/var/pi/bot";
++            }
++            const sessionId = crypto.randomUUID();
++            ctx.ui.notify(`Auto-connecting to Mattermost (project: ${projectPath})...`, "info");
++            const res = await bridgeFetch("/api/register-session", {
++                projectPath,
++                sessionId,
++            });
++            if (!res.ok) {
++                console.error(`[pi-matter] auto-connect failed: status ${res.status}`);
++                ctx.ui.notify(`Auto-connect failed (status ${res.status})`, "error");
++                return;
++            }
++            currentSession = {
++                channelId: res.data.channelId,
++                channelName: res.data.channelName,
++                sessionId: res.data.sessionId,
++                projectPath,
++            };
++            startPolling(pi, currentSession);
++            console.log(`[pi-matter] auto-connected to channel: ${res.data.channelName}`);
++            ctx.ui.notify(`Connected to Mattermost channel: ${res.data.channelName}`, "info");
++        });
++    }
++
+     pi.registerCommand("matter-clear", {
+         description: "DELETE ALL Mattermost channels created by pi-matter. Irreversible.",
+         handler: async (_args, ctx) => {

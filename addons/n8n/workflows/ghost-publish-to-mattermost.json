@@ -1,0 +1,131 @@
+{
+  "name": "Ghost publish → Mattermost",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "ghost-publish",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+      "name": "Webhook (Ghost)",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        240,
+        300
+      ],
+      "webhookId": "cs-ghost-publish"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Ghost post.published payload shape (per Ghost docs):\n//   { post: { current: { id, title, url, primary_author: { name }, excerpt, published_at }, previous: {...} } }\n//\n// Handle both the wrapped-under-'body' shape (n8n webhook default) and\n// the direct payload shape (in case Ghost is proxied through something\n// that strips the wrapper).\n\nconst body = $input.first().json.body || $input.first().json;\nconst current = body?.post?.current || {};\n\nconst title    = current.title || '(untitled)';\nconst url      = current.url || '';\nconst author   = current.primary_author?.name || 'Unknown author';\nconst excerpt  = current.excerpt || '';\nconst postedAt = current.published_at || new Date().toISOString();\nconst postId   = current.id || '';\n\n// Compact message for Mattermost. Keeps the excerpt to one paragraph.\nconst message = [\n  `:pencil2: **New post published** — *${title}*`,\n  `by **${author}** · ${postedAt}`,\n  '',\n  excerpt ? `> ${excerpt.replace(/\\n/g, ' ').slice(0, 240)}${excerpt.length > 240 ? '…' : ''}` : '',\n  url ? `[Read →](${url})` : ''\n].filter(Boolean).join('\\n');\n\nreturn [{ json: { message, postId, title, url, author } }];"
+      },
+      "id": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+      "name": "Format",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        460,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "resource": "message",
+        "operation": "post",
+        "channelId": "bot",
+        "message": "={{$json.message}}"
+      },
+      "id": "cccccccc-cccc-cccc-cccc-cccccccccccc",
+      "name": "Mattermost (pi-bot)",
+      "type": "n8n-nodes-base.mattermost",
+      "typeVersion": 1,
+      "position": [
+        720,
+        300
+      ],
+      "credentials": {
+        "mattermostApi": {
+          "name": "Mattermost (pi-bot)"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={\n  \"ok\": true,\n  \"post_id\": \"{{$('Format').item.json.postId}}\",\n  \"posted_to\": \"bot\"\n}",
+        "options": {}
+      },
+      "id": "dddddddd-dddd-dddd-dddd-dddddddddddd",
+      "name": "Respond 200",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [
+        980,
+        300
+      ]
+    }
+  ],
+  "connections": {
+    "Webhook (Ghost)": {
+      "main": [
+        [
+          {
+            "node": "Format",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format": {
+      "main": [
+        [
+          {
+            "node": "Mattermost (pi-bot)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Mattermost (pi-bot)": {
+      "main": [
+        [
+          {
+            "node": "Respond 200",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "tags": [
+    "creator-studio",
+    "ghost"
+  ],
+  "meta": {
+    "description": "Ghost's post.published webhook → format headline/author/excerpt → post to Mattermost #bot channel. Wire Ghost's admin webhook to POST here (setup-ghost.sh --wire-webhook does this automatically once you've minted a GHOST_ADMIN_API_KEY). Response is 200 with the post_id so Ghost doesn't retry.",
+    "stack_dependencies": {
+      "required_apps": [
+        "mattermost",
+        "n8n",
+        "ghost"
+      ],
+      "optional_apps": [],
+      "required_features": []
+    },
+    "addon_dependencies": [
+      "setup-mattermost",
+      "setup-n8n",
+      "setup-ghost"
+    ]
+  }
+}

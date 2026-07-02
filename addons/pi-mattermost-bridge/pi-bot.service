@@ -1,0 +1,65 @@
+[Unit]
+# Headless pi session that lives in a tmux session named 'pi-bot'.
+# Together with pi-mattermost.service, this gives you a persistent
+# bidirectional channel from anywhere with Mattermost access — type in
+# #bot, pi reads it and responds.
+#
+# Inspect / interact:  tmux attach -t pi-bot   (Ctrl-b d to detach)
+# Restart pi cleanly:  systemctl restart pi-bot
+# Stop:                systemctl stop pi-bot
+#
+# Why tmux? pi is a TUI and needs a pseudo-terminal. Raw systemd ExecStart
+# doesn't allocate one, so the TUI either dies or behaves oddly. tmux
+# allocates a pty, hosts pi inside it, and the systemd service is just
+# 'kept alive by RemainAfterExit + the tmux process'.
+Description=Persistent pi session for Mattermost integration (#bot channel)
+After=pi-mattermost.service network-online.target
+Wants=pi-mattermost.service network-online.target
+
+[Service]
+Type=forking
+User=root
+# WorkingDirectory must be '/' so ctx.cwd === '/' in the auto-connect block,
+# which triggers our projectPath="/var/pi/bot" fallback (see patches 02/03).
+# That makes the bridge bind this session to the pre-existing #bot channel
+# via the channel_mappings row inserted by setup-pi-mattermost-bridge.sh.
+WorkingDirectory=/
+# Explicit env — systemd units don't read ~/.bashrc or /etc/profile.d.
+Environment=HOME=/root
+Environment=USER=root
+Environment=PI_MATTERMOST_AUTO_CONNECT=1
+# ollama is installed at /usr/local/bin; pi-node provides node + npm.
+# Include both so 'ollama launch pi' resolves under tmux's minimal env.
+Environment=PATH=%%NODE_BIN_DIR%%:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+# Default model. Override by editing this line + `systemctl daemon-reload`
+# + `systemctl restart pi-bot`. Listed in models.json + settings.json
+# defaultModel — keeps the picker from re-appearing across restarts.
+Environment=PI_MODEL=%%PI_MODEL%%
+# Kill any existing pi-bot tmux session before starting fresh, so re-runs
+# don't end up with two pi sessions registered against the same channel.
+ExecStartPre=/bin/bash -c '/usr/bin/tmux kill-session -t pi-bot 2>/dev/null || true'
+# new-session -d = detach (run in background). tmux forks → parent exits →
+# systemd Type=forking is satisfied. The pi process keeps running inside
+# the tmux session.
+#
+# Non-interactive flags:
+#   --model gemma4:31b-cloud  — skip the model picker (state in models.json
+#                                is consulted but still shows picker without
+#                                explicit --model)
+#   --yes                     — auto-confirm "Update Available" and other
+#                                yes/no prompts that would otherwise block
+ExecStart=/usr/bin/tmux new-session -d -s pi-bot "cd / && ollama launch pi --model ${PI_MODEL} --yes"
+ExecStop=/usr/bin/tmux kill-session -t pi-bot
+# tmux exits as soon as it backgrounds; we want the service to remain
+# 'active (running)' as long as the tmux session itself is alive.
+RemainAfterExit=yes
+Restart=on-failure
+RestartSec=10s
+TimeoutStartSec=30s
+# pi reads ~/.pi/agent/settings.json for model + extensions at startup.
+# The default model is set there (gemma4:31b-cloud per task #92).
+# To override per-session, modify /root/.pi/agent/settings.json or pass
+# OLLAMA_MODEL via Environment= here.
+
+[Install]
+WantedBy=multi-user.target

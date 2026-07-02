@@ -1,0 +1,255 @@
+{
+  "name": "Plausible weekly digest → Mattermost",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 9 * * 1"
+            }
+          ]
+        }
+      },
+      "id": "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee",
+      "name": "Cron (Monday 9am)",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        240,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "plausible-weekly-digest",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "ffffffff-ffff-ffff-ffff-ffffffffffff",
+      "name": "Manual webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        240,
+        460
+      ],
+      "webhookId": "plausible-weekly-digest"
+    },
+    {
+      "parameters": {
+        "url": "=http://plausible:8000/api/v2/query",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"site_id\": \"{{$env.PLAUSIBLE_SITE_ID || 'soboldata.com'}}\",\n  \"metrics\": [\"visitors\", \"pageviews\", \"visits\", \"bounce_rate\", \"visit_duration\"],\n  \"date_range\": \"7d\",\n  \"dimensions\": []\n}",
+        "options": {
+          "timeout": 20000
+        }
+      },
+      "id": "11111111-2222-3333-4444-555555555555",
+      "name": "Plausible /api/v2/query",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        520,
+        380
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "name": "Plausible API"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "url": "=http://plausible:8000/api/v2/query",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"site_id\": \"{{$env.PLAUSIBLE_SITE_ID || 'soboldata.com'}}\",\n  \"metrics\": [\"pageviews\"],\n  \"date_range\": \"7d\",\n  \"dimensions\": [\"event:page\"],\n  \"order_by\": [[\"pageviews\", \"desc\"]],\n  \"pagination\": {\"limit\": 5}\n}",
+        "options": {
+          "timeout": 20000
+        }
+      },
+      "id": "22222222-3333-4444-5555-666666666666",
+      "name": "Plausible top pages",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        720,
+        380
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "name": "Plausible API"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Two upstream nodes both return Plausible /api/v2/query responses.\n// Shape (per Plausible v2 API docs):\n//   { results: [ { dimensions: [...], metrics: [n,n,n,...] } ], meta: {...} }\n//\n// - Node 1 ('Plausible /api/v2/query'): aggregate metrics, dimensions=[], one row.\n//   metrics order: visitors, pageviews, visits, bounce_rate, visit_duration\n// - Node 2 ('Plausible top pages'): dimensions=['event:page'], top 5 rows.\n//   metrics order: pageviews\n\nconst summary = $('Plausible /api/v2/query').first().json;\nconst pagesResp = $('Plausible top pages').first().json;\n\nconst row = summary?.results?.[0]?.metrics || [0, 0, 0, 0, 0];\nconst [visitors, pageviews, visits, bounce_rate, visit_duration] = row;\n\nconst pages = (pagesResp?.results || []).map(r => ({\n  path: r.dimensions?.[0] ?? '(unknown)',\n  views: r.metrics?.[0] ?? 0,\n}));\n\n// Format the Mattermost message. Numbers with locale formatting where helpful.\nconst fmt = (n) => Number(n || 0).toLocaleString('en-US');\nconst pct = (n) => `${Math.round((n || 0) * 100) / 100}%`;\nconst mins = (s) => `${Math.floor((s || 0) / 60)}m ${Math.round((s || 0) % 60)}s`;\n\nconst topPagesLines = pages.length\n  ? pages.map((p, i) => `${i + 1}. \\`${p.path}\\` — **${fmt(p.views)}** views`).join('\\n')\n  : '_(no pages recorded this week)_';\n\nconst message = [\n  ':bar_chart: **Weekly Plausible digest** (last 7 days)',\n  '',\n  `**Visitors:** ${fmt(visitors)}`,\n  `**Pageviews:** ${fmt(pageviews)}`,\n  `**Visits:** ${fmt(visits)}`,\n  `**Bounce rate:** ${pct(bounce_rate)}`,\n  `**Avg. visit duration:** ${mins(visit_duration)}`,\n  '',\n  '**Top pages:**',\n  topPagesLines,\n].join('\\n');\n\nreturn [{ json: { message, visitors, pageviews, visits, bounce_rate, visit_duration } }];"
+      },
+      "id": "33333333-4444-5555-6666-777777777777",
+      "name": "Format",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        920,
+        380
+      ]
+    },
+    {
+      "parameters": {
+        "resource": "message",
+        "operation": "post",
+        "channelId": "bot",
+        "message": "={{$json.message}}"
+      },
+      "id": "44444444-5555-6666-7777-888888888888",
+      "name": "Mattermost (pi-bot)",
+      "type": "n8n-nodes-base.mattermost",
+      "typeVersion": 1,
+      "position": [
+        1140,
+        380
+      ],
+      "credentials": {
+        "mattermostApi": {
+          "name": "Mattermost (pi-bot)"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={\n  \"ok\": true,\n  \"visitors\": {{$('Format').item.json.visitors}},\n  \"pageviews\": {{$('Format').item.json.pageviews}}\n}",
+        "options": {}
+      },
+      "id": "55555555-6666-7777-8888-999999999999",
+      "name": "Respond 200",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [
+        1360,
+        460
+      ]
+    }
+  ],
+  "connections": {
+    "Cron (Monday 9am)": {
+      "main": [
+        [
+          {
+            "node": "Plausible /api/v2/query",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Manual webhook": {
+      "main": [
+        [
+          {
+            "node": "Plausible /api/v2/query",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Plausible /api/v2/query": {
+      "main": [
+        [
+          {
+            "node": "Plausible top pages",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Plausible top pages": {
+      "main": [
+        [
+          {
+            "node": "Format",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format": {
+      "main": [
+        [
+          {
+            "node": "Mattermost (pi-bot)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Mattermost (pi-bot)": {
+      "main": [
+        [
+          {
+            "node": "Respond 200",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "tags": [
+    "creator-studio",
+    "plausible",
+    "digest"
+  ],
+  "meta": {
+    "description": "Every Monday at 9am, pulls last week's Plausible stats (visitors, pageviews, visits, bounce rate, avg duration + top 5 pages) via the Plausible v2 query API and posts a formatted digest to Mattermost #bot. Also exposes a manual webhook (POST /webhook/plausible-weekly-digest) for on-demand runs during testing.\n\nRequires: Plausible API key minted post-signup, saved as tokens `PLAUSIBLE_API_KEY` and imported into n8n as httpHeaderAuth credential 'Plausible API' with header 'Authorization: Bearer <key>'. Also set PLAUSIBLE_SITE_ID env var in the n8n CT (defaults to 'soboldata.com').\n\nAny stack that composes `plausible` + `mattermost` + `n8n` can enable this.",
+    "stack_dependencies": {
+      "required_apps": [
+        "plausible",
+        "mattermost",
+        "n8n"
+      ],
+      "optional_apps": [],
+      "required_features": []
+    },
+    "addon_dependencies": [
+      "setup-plausible",
+      "setup-mattermost",
+      "setup-n8n"
+    ]
+  }
+}

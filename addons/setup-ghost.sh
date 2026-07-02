@@ -154,10 +154,94 @@ find_ct_by_hostname() {
   return 1
 }
 
+# Extract "install Ghost stack inside CT" into a function so both paths
+# (new CT + existing partially-installed CT) run the same install code.
+# Each internal step is either idempotent (apt install, npm install -g)
+# or check-then-do (useradd, ghost install). Fixes the case where the
+# addon failed mid-install (e.g., #275 sudo bug) and re-running skipped
+# everything because the CT already exists.
+install_ghost_stack() {
+  local ctid="$1"
+
+  # Node.js 22 + build tooling (idempotent — apt install skips if present)
+  if ! pct exec "$ctid" -- node --version 2>/dev/null | grep -q '^v22\.'; then
+    log "  Installing Node.js 22 + build tooling..."
+    pct exec "$ctid" -- bash -lc '
+      set -e
+      export DEBIAN_FRONTEND=noninteractive
+      apt-get update -qq
+      apt-get install -y -qq curl ca-certificates gnupg build-essential python3 sudo
+      curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
+      apt-get install -y -qq nodejs
+      node --version
+      npm --version
+    ' 2>&1 | sed 's/^/    /'
+  else
+    log "  Node.js 22 already installed."
+  fi
+
+  # ghost-cli (idempotent — npm install -g overwrites)
+  if ! pct exec "$ctid" -- bash -lc 'command -v ghost' >/dev/null 2>&1; then
+    log "  Installing ghost-cli globally..."
+    pct exec "$ctid" -- bash -lc 'npm install -g ghost-cli@latest' 2>&1 | sed 's/^/    /'
+  else
+    log "  ghost-cli already installed."
+  fi
+
+  # ghost-mgr user + passwordless sudo (check-then-do)
+  # Fresh pct-create Debian templates don't ship the sudo package —
+  # install it defensively before touching /etc/sudoers.d/.
+  log "  Ensuring ghost-mgr user + passwordless sudo..."
+  pct exec "$ctid" -- bash -lc "
+    set -e
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get install -y -qq sudo
+    if ! id ghost-mgr >/dev/null 2>&1; then
+      useradd -m -s /bin/bash -G sudo ghost-mgr
+    fi
+    echo 'ghost-mgr ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/ghost-mgr
+    chmod 440 /etc/sudoers.d/ghost-mgr
+    mkdir -p /var/www/ghost
+    chown ghost-mgr:ghost-mgr /var/www/ghost
+    chmod 755 /var/www/ghost
+  "
+
+  # Ghost install (NOT idempotent — check for config.production.json)
+  if pct exec "$ctid" -- test -f /var/www/ghost/config.production.json 2>/dev/null; then
+    log "  Ghost already installed (config.production.json present) — skipping install."
+  else
+    log "  Running ghost install as ghost-mgr (this takes 2-3 min)..."
+    pct exec "$ctid" -- bash -lc "
+      set -e
+      su - ghost-mgr -c '
+        cd /var/www/ghost && \
+        ghost install \
+          --no-prompt \
+          --no-setup-nginx \
+          --no-setup-ssl \
+          --url https://$DOMAIN \
+          --db mysql \
+          --dbhost $MARIADB_LISTEN_IP \
+          --dbport 3306 \
+          --dbuser ghost_user \
+          --dbpass \"$GHOST_DB_PASSWORD\" \
+          --dbname ghost_db \
+          --port 2368 \
+          --process systemd \
+          --ip 0.0.0.0
+      '
+    " 2>&1 | sed 's/^/    /'
+  fi
+}
+
 EXISTING_CTID="$(find_ct_by_hostname "$GHOST_HOSTNAME" 2>/dev/null || true)"
 if [[ -n "$EXISTING_CTID" ]]; then
   log "  Found existing CT $EXISTING_CTID ($GHOST_HOSTNAME) — using it."
   GHOST_CTID="$EXISTING_CTID"
+  # Run install steps in case CT is partial (idempotent)
+  if (( ! DRY_RUN )); then
+    install_ghost_stack "$GHOST_CTID"
+  fi
 else
   # Community-scripts dropped ct/ghost.sh in July 2026 (only ghostfolio.sh
   # remains, unrelated). We create the CT directly via `pct create` + a
@@ -246,75 +330,9 @@ TUN_BLOCK
         warn "  Tailscale join returned non-zero — continuing (LAN-only fallback ok)."
     fi
 
-    # ----- Install Node.js 22 + build tooling + ghost-cli ---------------
-    # Ghost 6.0 requires Node 22.13+. NodeSource maintains an up-to-date
-    # Debian repo; using it avoids Debian's stale packaged node.
-    log "  Installing Node.js 22 + build tooling..."
-    pct exec "$GHOST_CTID" -- bash -lc '
-      set -e
-      export DEBIAN_FRONTEND=noninteractive
-      apt-get update -qq
-      apt-get install -y -qq curl ca-certificates gnupg build-essential python3
-      # NodeSource setup script — pins the correct apt repo for node 22.x
-      curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
-      apt-get install -y -qq nodejs
-      node --version
-      npm --version
-    ' 2>&1 | sed 's/^/    /'
-
-    log "  Installing ghost-cli globally..."
-    pct exec "$GHOST_CTID" -- bash -lc 'npm install -g ghost-cli@latest' 2>&1 | sed 's/^/    /'
-
-    # ----- Create ghost-mgr user (ghost-cli refuses to run as root) -----
-    # ghost-cli hard-refuses root since 1.5.0. Standard pattern is a
-    # dedicated sudo-capable "mgr" user under which `ghost install`
-    # runs; ghost install then creates a SECOND daemon user called
-    # 'ghost' (no shell) that owns the systemd unit and content dir.
-    log "  Creating ghost-mgr user with passwordless sudo..."
-    pct exec "$GHOST_CTID" -- bash -lc "
-      set -e
-      if ! id ghost-mgr >/dev/null 2>&1; then
-        useradd -m -s /bin/bash -G sudo ghost-mgr
-      fi
-      # Passwordless sudo for ghost-install commands
-      echo 'ghost-mgr ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/ghost-mgr
-      chmod 440 /etc/sudoers.d/ghost-mgr
-      # Ghost install dir — must be /var/www/<name>, NOT /home or /root
-      # (ghost-cli generates permissions errors otherwise)
-      mkdir -p /var/www/ghost
-      chown ghost-mgr:ghost-mgr /var/www/ghost
-      chmod 755 /var/www/ghost
-    "
-
-    # ----- Run ghost install (non-interactive) --------------------------
-    # --db mysql --dbhost <mariadb-tailnet-ip> --dbuser ghost_user
-    # --dbpass <from-tokens> --dbname ghost_db
-    # --no-setup-nginx --no-setup-ssl — Cloudflared handles ingress
-    # --no-prompt — feed all answers via flags; die if anything's missing
-    # --no-setup-systemd — we set up the unit ourselves via ghost start
-    #                     (Ghost's systemd unit generation still works
-    #                     via 'ghost start', which creates ghost_<name>.service)
-    log "  Running ghost install as ghost-mgr (this takes 2-3 min)..."
-    pct exec "$GHOST_CTID" -- bash -lc "
-      set -e
-      su - ghost-mgr -c '
-        cd /var/www/ghost && \
-        ghost install \
-          --no-prompt \
-          --no-setup-nginx \
-          --no-setup-ssl \
-          --url https://$DOMAIN \
-          --db mysql \
-          --dbhost $MARIADB_LISTEN_IP \
-          --dbport 3306 \
-          --dbuser ghost_user \
-          --dbpass \"$GHOST_DB_PASSWORD\" \
-          --dbname ghost_db \
-          --port 2368 \
-          --process systemd \
-          --ip 0.0.0.0
-      '
-    " 2>&1 | sed 's/^/    /'
+    # Now run the install stack (Node + ghost-cli + ghost-mgr + ghost install)
+    # via the shared function that also handles partial-install recovery.
+    install_ghost_stack "$GHOST_CTID"
   fi
 fi
 

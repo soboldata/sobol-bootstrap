@@ -519,13 +519,13 @@ gitea_first_run_setup() {
       log "  ✓ POST accepted (redirected). Waiting for INSTALL_LOCK to appear..."
       ;;
     200)
-      # Gitea re-rendered the install page. Something failed validation.
-      warn "  POST returned 200 (Gitea re-rendered install page). Common causes:"
-      warn "    - db_path permission denied (SQLite can't write /var/lib/gitea/data/gitea.db)"
-      warn "    - domain / app_url validation failure"
-      warn "    - Gitea version schema drift (form field added or renamed)"
-      warn "  Response body head from /tmp/gitea-install-resp.html above."
-      die "  Gitea /install POST didn't finalize (200 = validation error). See above."
+      # Gitea 1.26+ returns 200 with the install page HTML EVEN ON
+      # SUCCESSFUL install (bug/regression in post-install redirect).
+      # Can't decide from status alone — verify by side-effect: did
+      # app.ini + INSTALL_LOCK=true appear? Loop handles both cases:
+      #   - Real success: app.ini appears, we proceed.
+      #   - Real validation error: app.ini never appears, die loop fires.
+      log "  POST returned 200 (Gitea 1.26+ returns 200 on successful install too — verifying side-effects)..."
       ;;
     *)
       die "  Gitea /install POST failed with HTTP $post_status. Debug:

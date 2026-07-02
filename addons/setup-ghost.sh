@@ -132,6 +132,30 @@ SMTP_FROM="$(read_token SMTP_FROM || echo "\"Ghost\" <no-reply@${DOMAIN}>")"
 TS_AUTHKEY="$(read_token TS_AUTHKEY || true)"
 CT_PASSWORD="$(read_token CT_PASSWORD || true)"
 
+# ----- DOMAIN validation -------------------------------------------------
+# Ghost's URL validator (ConfigError in ghost-cli) rejects hostnames
+# without a TLD. `DOMAIN=ghost` yields `--url https://ghost` which fails
+# with "Invalid domain. Your domain should include a protocol and a
+# TLD". Validate here so we fail before spending 3+ minutes on the
+# install step. Acceptable shapes:
+#   - <sub>.<domain>.<tld>  e.g., ghost.example.com
+#   - <domain>.<tld>        e.g., mysite.com
+#   - <sub>.local           e.g., ghost.local (validation-only)
+#   - <ip>[:<port>]         e.g., 100.76.39.65:2368 (validation-only)
+# Rejects bare hostnames (`ghost`), FQDNs missing a TLD, empty values.
+if [[ ! "$DOMAIN" =~ ^[a-zA-Z0-9]([a-zA-Z0-9.-]*[a-zA-Z0-9])?\.[a-zA-Z]{2,}$ ]] && \
+   [[ ! "$DOMAIN" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}(:[0-9]+)?$ ]]; then
+  die "DOMAIN='$DOMAIN' in $TOKENS_FILE is not a valid Ghost URL.
+  Ghost requires a hostname with a TLD (e.g. ghost.example.com), a
+  .local hostname (e.g. ghost.local), or an IP address.
+
+  Fix: edit $TOKENS_FILE and set one of:
+    DOMAIN=your-real-domain.com         (production)
+    DOMAIN=ghost.local                  (validation/testing)
+    DOMAIN=100.76.39.65:2368            (raw tailnet IP:port)
+  Then re-run this addon."
+fi
+
 # ----- MariaDB dependency check -----------------------------------------
 # Ghost is MySQL-only (Postgres was dropped at Ghost 1.0). We depend on
 # a shared MariaDB CT provisioned by setup-mariadb-shared.sh, which
@@ -210,6 +234,22 @@ install_ghost_stack() {
   if pct exec "$ctid" -- test -f /var/www/ghost/config.production.json 2>/dev/null; then
     log "  Ghost already installed (config.production.json present) — skipping install."
   else
+    # Partial install detection: if /var/www/ghost has leftover state
+    # from a failed prior install (versions/, node_modules/, current)
+    # but no config.production.json, ghost install will trip on the
+    # existing files. Also the 'ghost' system user may already own
+    # subdirs (like content/) that ghost-mgr can't write to. Reset the
+    # directory clean, restore ghost-mgr ownership, and try fresh.
+    if pct exec "$ctid" -- bash -c 'ls /var/www/ghost 2>/dev/null | grep -qE "versions|node_modules|current|content"' 2>/dev/null; then
+      log "  Detected partial Ghost install — resetting /var/www/ghost for clean retry..."
+      pct exec "$ctid" -- bash -lc '
+        set -e
+        rm -rf /var/www/ghost/* /var/www/ghost/.[!.]* 2>/dev/null || true
+        chown -R ghost-mgr:ghost-mgr /var/www/ghost
+        chmod 755 /var/www/ghost
+      '
+    fi
+
     log "  Running ghost install as ghost-mgr (this takes 2-3 min)..."
     pct exec "$ctid" -- bash -lc "
       set -e

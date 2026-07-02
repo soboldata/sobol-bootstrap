@@ -520,13 +520,27 @@ print(json.dumps({
   fi
 
   if [[ -z "$N8N_API_KEY" ]]; then
-    KEY_BODY='{"label":"td-proxmox automation"}'
+    # Body shapes across n8n versions:
+    #   1.0-1.48:  {"label":"..."}                          (simple)
+    #   1.49-1.59: {"label":"...", "expiresAt": null}       (expiresAt required)
+    #   1.60+:     {"label":"...", "expiresAt": null,
+    #              "scopes": ["*:*", ...]}                   (scopes may be req)
+    # We try progressively richer bodies. Any 2xx wins.
+    KEY_BODIES=(
+      '{"label":"td-proxmox automation"}'
+      '{"label":"td-proxmox automation","expiresAt":null}'
+      '{"label":"td-proxmox automation","expiresAt":null,"scopes":["*"]}'
+    )
+    KEY_FAILURES=""
     for endpoint in /rest/api-keys /rest/me/api-keys; do
-      KEY_RESP="$(n8n_curl POST "$endpoint" "$KEY_BODY" 2> /tmp/n8n-key.code)"
-      KEY_CODE="$(awk '{print $2}' /tmp/n8n-key.code 2>/dev/null)"
-      log "  Trying $endpoint — HTTP $KEY_CODE"
-      if [[ "$KEY_CODE" =~ ^2 ]]; then
-        N8N_API_KEY="$(echo "$KEY_RESP" | python3 -c '
+      for KEY_BODY in "${KEY_BODIES[@]}"; do
+        KEY_RESP="$(n8n_curl POST "$endpoint" "$KEY_BODY" 2> /tmp/n8n-key.code)"
+        KEY_CODE="$(awk '{print $2}' /tmp/n8n-key.code 2>/dev/null)"
+        # Show the shape being tried so operators can see the progression
+        SHAPE="$(echo "$KEY_BODY" | python3 -c 'import sys,json; d=json.load(sys.stdin); print("+".join(sorted(d.keys())))')"
+        log "  Trying $endpoint [$SHAPE] — HTTP $KEY_CODE"
+        if [[ "$KEY_CODE" =~ ^2 ]]; then
+          N8N_API_KEY="$(echo "$KEY_RESP" | python3 -c '
 import sys, json
 try:
     d = json.load(sys.stdin)
@@ -534,15 +548,23 @@ try:
     print(data.get("rawApiKey") or data.get("apiKey") or "")
 except Exception:
     pass' 2>/dev/null)"
-        if [[ -n "$N8N_API_KEY" ]]; then
-          upsert_token N8N_API_KEY "$N8N_API_KEY"
-          log "  ✓ N8N_API_KEY minted via $endpoint and saved to $TOKENS_FILE"
-          break
-        else
-          warn "  $endpoint returned 2xx but no key in response body:"
-          echo "$KEY_RESP" | head -3 | sed 's/^/    /' >&2
+          if [[ -n "$N8N_API_KEY" ]]; then
+            upsert_token N8N_API_KEY "$N8N_API_KEY"
+            log "  ✓ N8N_API_KEY minted via $endpoint (shape=$SHAPE) and saved to $TOKENS_FILE"
+            break 2
+          else
+            warn "  $endpoint returned 2xx but no key in response body:"
+            echo "$KEY_RESP" | head -3 | sed 's/^/    /' >&2
+          fi
+        elif [[ "$KEY_CODE" == "400" ]]; then
+          # 400 body carries the validation error — capture the first one we
+          # see for the diagnostic block below. Newer n8n typically says
+          # "expiresAt is required" or "scopes must be an array".
+          if [[ -z "$KEY_FAILURES" ]]; then
+            KEY_FAILURES="$endpoint [$SHAPE] → 400: $(echo "$KEY_RESP" | head -c 300)"
+          fi
         fi
-      fi
+      done
     done
   fi
 
@@ -550,6 +572,11 @@ except Exception:
     log "================================================================"
     warn "  No API key available — auto-mint failed and none in tokens file."
     warn ""
+    if [[ -n "$KEY_FAILURES" ]]; then
+      warn "  First 400 body captured (helps identify the schema n8n now wants):"
+      printf '    %s\n' "$KEY_FAILURES" >&2
+      warn ""
+    fi
     warn "  This usually means login failed (HTTP 401), which means either:"
     warn "    1. The password in $TOKENS_FILE doesn't match what the owner"
     warn "       account in n8n was actually created with, OR"
@@ -702,10 +729,69 @@ elif [[ ! -d "$WORKFLOWS_DIR" ]]; then
 else
   log "Importing starter workflows..."
 
+  # Build the set of "apps present on this host" to filter workflows against.
+  # Sources: pct list hostnames (installed CTs) + special "features" derived
+  # from tokens.txt (email_relay if SMTP_HOST set, etc).
+  #
+  # Rationale: sobol-foundation/addons/n8n/workflows/ is a shared LIBRARY
+  # containing every workflow across every stack (foundation, creator-studio,
+  # sobol-mirror, founder-ai-os). Prior versions imported ALL of them
+  # unconditionally, which meant a foundation-only install got ghost /
+  # plausible / calcom / cloudflared / slack-mirror workflows referencing
+  # services that don't exist — their credentials were dead, activation
+  # would fail. Filter by meta.stack_dependencies.required_apps before
+  # importing so each install only gets workflows relevant to its footprint.
+  RUNNING_APPS_LIST="$(pct list 2>/dev/null | awk 'NR>1 {print $1}' | while read -r _cid; do
+    pct config "$_cid" 2>/dev/null | awk '/^hostname:/ {print $2}'
+  done | sort -u | tr '\n' ',' | sed 's/,$//')"
+  log "  Present apps (from pct list): $RUNNING_APPS_LIST"
+
+  # Feature set: derived from tokens.txt. Extend as we add feature flags.
+  RUNNING_FEATURES=""
+  if [[ -n "$(read_token SMTP_HOST 2>/dev/null || true)" ]]; then
+    RUNNING_FEATURES="email_relay"
+  fi
+  [[ -n "$RUNNING_FEATURES" ]] && log "  Present features (from tokens.txt): $RUNNING_FEATURES"
+
   if (( ! DRY_RUN )); then
     for wf in "$WORKFLOWS_DIR"/*.json; do
       [[ -f "$wf" ]] || continue
       WF_NAME="$(basename "$wf" .json)"
+
+      # Read meta.stack_dependencies and decide: import or skip?
+      # Returns "OK" or "SKIP: reason".
+      DEP_CHECK="$(APPS_PRESENT="$RUNNING_APPS_LIST" FEATURES_PRESENT="$RUNNING_FEATURES" python3 -c "
+import json, os, sys
+try:
+    with open('$wf') as f:
+        w = json.load(f)
+except Exception as e:
+    print('SKIP: unparseable JSON (' + str(e) + ')')
+    sys.exit(0)
+
+deps = (w.get('meta') or {}).get('stack_dependencies') or {}
+required_apps = deps.get('required_apps') or []
+required_features = deps.get('required_features') or []
+
+present_apps = set(a for a in os.environ.get('APPS_PRESENT', '').split(',') if a)
+present_features = set(f for f in os.environ.get('FEATURES_PRESENT', '').split(',') if f)
+
+missing_apps = [a for a in required_apps if a not in present_apps]
+missing_features = [f for f in required_features if f not in present_features]
+
+if missing_apps or missing_features:
+    parts = []
+    if missing_apps:     parts.append('missing apps: ' + ','.join(missing_apps))
+    if missing_features: parts.append('missing features: ' + ','.join(missing_features))
+    print('SKIP: ' + '; '.join(parts))
+else:
+    print('OK')
+")"
+
+      if [[ "$DEP_CHECK" != "OK" ]]; then
+        log "  ⊘ Skipping: $WF_NAME ($DEP_CHECK)"
+        continue
+      fi
 
       # Read + clean the JSON locally; also patch real Mattermost channel
       # UUIDs into any Mattermost node (n8n 2.x's MM node doesn't resolve

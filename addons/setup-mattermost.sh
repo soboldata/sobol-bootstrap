@@ -96,6 +96,11 @@ warn() { printf "\n\033[1;33m[setup-mattermost]\033[0m %s\n" "$*" >&2; }
 die()  { printf "\n\033[1;31m[setup-mattermost]\033[0m %s\n" "$*" >&2; exit 1; }
 run()  { if (( DRY_RUN )); then printf "[dry-run] %s\n" "$*"; else eval "$@"; fi; }
 
+# Shared CT lifecycle helpers (ct_wait_ready + friends). Defined AFTER
+# log/warn so the library sees our project-specific formatters.
+# shellcheck source=lib/ct-helpers.sh
+source "$(dirname "${BASH_SOURCE[0]}")/lib/ct-helpers.sh"
+
 [[ $EUID -eq 0 ]] || die "Run as root on the PVE host."
 command -v pct  >/dev/null || die "pct not found — PVE host required."
 command -v curl >/dev/null || die "curl not found — install with: apt-get install -y curl"
@@ -321,20 +326,26 @@ lxc.mount.entry: /dev/net/tun dev/net/tun none bind,create=file
 TUN_BLOCK
       # Reboot so the mount takes effect.
       run "pct reboot $CTID"
-      log "Waiting for CT to come back after reboot..."
-      sleep 8
-      for i in {1..30}; do
-        pct exec "$CTID" -- ping -c1 -W2 1.1.1.1 >/dev/null 2>&1 && break
-        sleep 2
-      done
+      log "Waiting for CT to come back fully after reboot (IP + DNS)..."
+      # Was: sleep 8 + ping-only loop. Ping tests IP-connectivity but
+      # returns green before systemd-resolved is ready, so downstream
+      # apt/curl calls that hit hostnames would fail with 'Temporary
+      # failure resolving' on fresh Ubuntu 24 CTs. ct_wait_ready waits
+      # for both IP and DNS + restarts systemd-resolved as recovery if
+      # DNS doesn't come up. See TROUBLESHOOTING_LOG 2026-07-02.
+      if (( ! DRY_RUN )); then
+        ct_wait_ready "$CTID" || die "CT $CTID not fully ready after reboot — see diagnostics above"
+      fi
     fi
   fi
 
   # ----- Tailscale join ----------------------------------------------------
   if (( ! SKIP_TAILSCALE )); then
     log "Installing Tailscale + joining tailnet as '$HOSTNAME'..."
-    run "pct exec $CTID -- bash -lc 'apt-get update -qq && apt-get install -y -qq curl ca-certificates'"
-    run "pct exec $CTID -- bash -lc 'curl -fsSL https://tailscale.com/install.sh | sh'"
+    # Dropped -qq on apt so operators see actual progress. Wrapped Tailscale
+    # install in timeout so it can't hang forever on a slow install.sh.
+    run "pct exec $CTID -- bash -lc 'DEBIAN_FRONTEND=noninteractive apt-get update && apt-get install -y --no-install-recommends curl ca-certificates 2>&1 | tail -3'"
+    run "pct exec $CTID -- bash -lc 'curl -fsSL --max-time 90 https://tailscale.com/install.sh | sh'"
     run "pct exec $CTID -- tailscale up --reset --authkey '$TS_AUTHKEY' --hostname '$HOSTNAME' --accept-routes --accept-dns"
 
     log "Waiting for Tailscale to reach Running..."

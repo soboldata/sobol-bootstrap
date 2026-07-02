@@ -96,6 +96,64 @@ ADMIN_NOTIFY_EMAIL set. `--test-only` lets you verify without re-config.
 
 ## Entries
 
+## 2026-07-02 xx:xx CT — Mattermost install fails DNS resolution after /dev/net/tun reboot (Ubuntu 24 CT)
+
+**Symptom:** Real-hardware install of `setup-mattermost.sh` on `creator`
+PVE host stalled for ~5 min after the "Waiting for CT to come back
+after reboot..." log line, then produced:
+
+```
+W: Failed to fetch http://archive.ubuntu.com/ubuntu/dists/noble/InRelease
+   Temporary failure resolving 'archive.ubuntu.com'
+[repeated for postgresql apt repo, mattermost apt repo]
+curl: (6) Could not resolve host: tailscale.com
+lxc-attach: 100: ... Failed to exec "tailscale"
+```
+
+Ping to `1.1.1.1` succeeded inside the CT but hostname resolution
+failed for every remote — `apt-get update`, then `curl | sh` from
+tailscale.com, then `tailscale up`.
+
+**Root cause:** Race between the CT's post-reboot `systemd-resolved`
+coming up and the addon's next `pct exec` call. Community-scripts
+installs Mattermost on Ubuntu 24 (noble), which uses systemd-resolved
+as the local DNS resolver. After we add `/dev/net/tun` passthrough via
+LXC config and `pct reboot`, systemd-resolved takes a few seconds to
+start. During that gap, `getent hosts <anything>` fails.
+
+Our readiness check was ping-only (`ping -c1 -W2 1.1.1.1`), which
+tests IP connectivity but returns green while DNS is still down. False
+green → downstream commands hit "Temporary failure resolving".
+
+**Fix (in code, per CLAUDE.md "Install debugging: fix the script"):**
+New shared library `addons/lib/ct-helpers.sh` with `ct_wait_ready()`
+that waits for IP + DNS + restarts systemd-resolved as recovery if DNS
+doesn't come up in the normal window. `setup-mattermost.sh` now sources
+the library and calls `ct_wait_ready "$CTID"` instead of its ad-hoc
+sleep+ping loop.
+
+**Files / Commit:** `addons/lib/ct-helpers.sh` (new — sourceable);
+`addons/setup-mattermost.sh` (sources the helper + replaces reboot-wait block).
+Follow-up task #247 migrates other addons (setup-n8n, setup-new-pi-agent,
+setup-postgres-shared) to use the same helper.
+
+**Immediate remediation for a stuck box:**
+```bash
+# Kick DNS back up manually
+pct exec 100 -- systemctl restart systemd-resolved
+sleep 5
+pct exec 100 -- getent hosts tailscale.com   # confirm working
+# Then re-run the addon (idempotent — picks up where it left off)
+cd /root/sobol-foundation && ./addons/setup-mattermost.sh
+```
+
+**Related:** Any addon that does `pct reboot` + `pct exec apt-get`
+downstream is vulnerable to this. Migrate them all to `ct_wait_ready`.
+Also apt-get `-qq` mode had been silencing all progress — dropped that
+so operators can see what step they're in.
+
+---
+
 ## 2026-07-01 14:xx CT — Fresh PVE 9 install 401s on enterprise.proxmox.com (bootstrap-fresh-pve.sh)
 
 **Symptom:** First real-hardware install of a fresh PVE 9.1.1 host via

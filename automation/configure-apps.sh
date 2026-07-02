@@ -1608,11 +1608,21 @@ configure_email() {
   fi
 
   # Run it. The addon reads from td-tokens.txt directly, no env passthrough needed.
+  #
+  # `|| true` intentional: email test-send is a nice-to-have, not a
+  # blocker. Prior version let a non-zero exit from setup-pve-email.sh
+  # (e.g. the mailq grep-v pipefail bug) abort the whole configure-apps
+  # run BEFORE configure_gitea got a chance. If email fails, we warn
+  # and continue — the operator can fix SMTP later without redoing the
+  # whole install. Same applies to sed's exit code via pipefail.
   if (( DRY_RUN )); then
     log "  [dry-run] would run: $EMAIL_ADDON --tokens $TOKENS_FILE --dry-run"
-    bash "$EMAIL_ADDON" --tokens "$TOKENS_FILE" --dry-run 2>&1 | sed 's/^/    /' | head -20
+    bash "$EMAIL_ADDON" --tokens "$TOKENS_FILE" --dry-run 2>&1 | sed 's/^/    /' | head -20 || true
   else
-    bash "$EMAIL_ADDON" --tokens "$TOKENS_FILE" 2>&1 | sed 's/^/  /'
+    if ! bash "$EMAIL_ADDON" --tokens "$TOKENS_FILE" 2>&1 | sed 's/^/  /'; then
+      warn "  setup-pve-email.sh exited non-zero. Continuing with other configuration."
+      warn "  Debug: bash addons/setup-pve-email.sh --tokens $TOKENS_FILE"
+    fi
   fi
 }
 

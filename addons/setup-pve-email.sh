@@ -235,9 +235,15 @@ if (( ! DRY_RUN )); then
   printf "Subject: Test from PVE $(hostname)\nFrom: %s <%s>\n\nThis is a test email from PVE %s at %s.\n\nIf you got this, postfix relay is working. Future PVE alerts (vzdump completion, subscription nag, root cron output) will route through %s and land here.\n" \
     "$SMTP_FROM_NAME" "$SMTP_FROM" "$(hostname)" "$(date)" "$SMTP_HOST" | sendmail -t "$ADMIN_NOTIFY_EMAIL"
   sleep 3
-  # Check mail queue — if test got stuck, surface it
-  queue=$(mailq | grep -v "^Mail queue is empty" | wc -l)
-  if (( queue > 1 )); then
+  # Check mail queue — if test got stuck, surface it.
+  # NB. `grep -v "^Mail queue is empty"` used to be the check, but under
+  # set -Eeuo pipefail it BREAKS in the HAPPY PATH: when the queue is
+  # empty (mailq prints only that literal line), grep -v filters it out,
+  # exits 1 (no matches), pipefail propagates, command substitution
+  # returns non-zero, and set -e kills the script. Replaced with a
+  # simple string check that always exits 0 and lets pipefail be quiet.
+  mailq_out=$(mailq 2>&1 || true)
+  if ! grep -q "Mail queue is empty" <<<"$mailq_out"; then
     warn "  Mail queue not empty after send. Check 'mailq' and 'journalctl -u postfix -n 30'"
   fi
 fi

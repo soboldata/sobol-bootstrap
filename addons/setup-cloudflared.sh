@@ -121,11 +121,34 @@ pct_exec() {
 log "Pre-flight..."
 
 CLOUDFLARED_CTID="$(read_token CLOUDFLARED_CTID || echo 304)"
-DOMAIN="$(read_token DOMAIN || die "DOMAIN missing from $TOKENS_FILE")"
 
+# Soft-fail on missing prerequisites so setup-stack.sh's addon loop
+# doesn't die and abort the whole install. Prints the "come back after"
+# note and exits 0. Operator finishes CF setup, adds tokens, re-runs.
+# Same pattern as setup-pve-email.sh's SMTP_HOST-missing skip.
 if (( ! UNINSTALL )); then
-  CF_TUNNEL_TOKEN="$(read_token CF_TUNNEL_TOKEN || \
-    die "CF_TUNNEL_TOKEN missing. Create a tunnel in Cloudflare Zero Trust dashboard (Networks → Tunnels → Create), then save the token to $TOKENS_FILE as CF_TUNNEL_TOKEN=eyJh...")"
+  DOMAIN="$(read_token DOMAIN 2>/dev/null || true)"
+  CF_TUNNEL_TOKEN="$(read_token CF_TUNNEL_TOKEN 2>/dev/null || true)"
+
+  MISSING=()
+  [[ -z "$DOMAIN" ]] && MISSING+=("DOMAIN")
+  [[ -z "$CF_TUNNEL_TOKEN" ]] && MISSING+=("CF_TUNNEL_TOKEN")
+
+  if (( ${#MISSING[@]} > 0 )); then
+    warn "Cloudflared install skipped — missing from $TOKENS_FILE: ${MISSING[*]}"
+    warn ""
+    warn "  To enable:"
+    warn "    1. Create a tunnel in Cloudflare Zero Trust dashboard:"
+    warn "       Networks → Tunnels → Create tunnel"
+    warn "    2. Copy the TUNNEL_TOKEN (a long eyJh... string)"
+    warn "    3. Add to $TOKENS_FILE:"
+    warn "         DOMAIN=your-domain.com"
+    warn "         CF_TUNNEL_TOKEN=eyJh..."
+    warn "    4. Re-run this addon (or setup-stack.sh <stack> --continue)"
+    warn ""
+    warn "  Skipping cloudflared install. Other addons proceed normally."
+    exit 0
+  fi
 fi
 
 # CT check

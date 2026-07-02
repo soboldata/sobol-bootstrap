@@ -121,6 +121,28 @@ _read_token_field() {
   awk -F= -v k="$key" '$1 == k { sub(/^[^=]*=/, "", $0); print; exit }' "$TOKENS_FILE"
 }
 
+# Helper: persist a KEY=value pair to /root/td-tokens.txt right after
+# a prompt succeeds. write_summary rewrites the whole file at the end
+# of a successful run, but that block never runs if an earlier addon
+# step (Mattermost install, Homepage tile write, etc.) crashes. Persisting
+# each prompted value inline means a mid-run failure doesn't lose the
+# password — the operator re-runs and it's already in tokens.
+#
+# No-op on DRY_RUN. Creates tokens file with 0600 if missing.
+_upsert_token_field() {
+  local key="$1" val="$2"
+  (( DRY_RUN )) && return 0
+  if [[ ! -f "$TOKENS_FILE" ]]; then
+    umask 077
+    : > "$TOKENS_FILE"
+  fi
+  if grep -q "^${key}=" "$TOKENS_FILE"; then
+    sed -i "/^${key}=/d" "$TOKENS_FILE"
+  fi
+  printf '%s=%s\n' "$key" "$val" >> "$TOKENS_FILE"
+  chmod 600 "$TOKENS_FILE"
+}
+
 resolve_admin_user() {
   if [[ -n "$ADMIN_USER" ]]; then return; fi
   # Prefer existing td-tokens.txt value over re-prompting
@@ -133,6 +155,7 @@ resolve_admin_user() {
   printf "\n\033[1;36m[configure-apps]\033[0m Admin username for Gitea + OpenWebUI (e.g. td): " >&2
   IFS= read -r ADMIN_USER
   [[ -n "$ADMIN_USER" ]] || die "Admin user can't be empty."
+  _upsert_token_field ADMIN_USER "$ADMIN_USER"
 }
 
 resolve_admin_email() {
@@ -147,6 +170,7 @@ resolve_admin_email() {
   IFS= read -r ADMIN_EMAIL
   [[ "$ADMIN_EMAIL" =~ ^[^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+$ ]] \
     || die "That doesn't look like a valid email."
+  _upsert_token_field ADMIN_EMAIL "$ADMIN_EMAIL"
 }
 
 resolve_admin_password() {
@@ -173,6 +197,8 @@ resolve_admin_password() {
   [[ "$pw1" == "$pw2"  ]] || die "Passwords didn't match."
   [[ ${#pw1} -ge 12    ]] || die "Password too short (need >= 12 chars to satisfy filebrowser)."
   ADMIN_PASSWORD="$pw1"
+  _upsert_token_field ADMIN_PASSWORD "$ADMIN_PASSWORD"
+  log "Persisted ADMIN_PASSWORD to $TOKENS_FILE — safe to interrupt / re-run without re-prompting."
 }
 
 resolve_openrouter_key() {
@@ -188,6 +214,7 @@ resolve_openrouter_key() {
   echo >&2
   [[ "$OPENROUTER_KEY" =~ ^sk-or- ]] \
     || die "That doesn't look like an OpenRouter key (expected sk-or-...)."
+  _upsert_token_field OPENROUTER_API_KEY "$OPENROUTER_KEY"
 }
 
 resolve_smtp_creds() {

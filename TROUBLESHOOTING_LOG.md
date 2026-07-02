@@ -96,6 +96,101 @@ ADMIN_NOTIFY_EMAIL set. `--test-only` lets you verify without re-config.
 
 ## Entries
 
+## 2026-07-02 xx:xx CT — Mattermost bot creation 403'd because ADMIN_PASSWORD was prompted-but-not-persisted
+
+**Symptom:** Real-hardware install on `creator` completed the CT create +
+admin signup + team create — then failed at bot creation with:
+
+```
+Bot create returned HTTP 403
+```
+
+Follow-up diagnostic (rerunning setup-mattermost.sh in place):
+
+```
+Session token length: 0
+Login raw response:  400 Bad Request  "Password field must not be blank"
+EnableBotAccountCreation: None
+ADMIN_PASSWORD MISSING or EMPTY in /root/td-tokens.txt
+```
+
+**Root cause:** Two-layer bug in the credential-persistence chain.
+
+Layer 1 — `boot.sh` (public shim) collected `TS_AUTHKEY`, `ADMIN_EMAIL`,
+`ADMIN_USER`, and `CT_PASSWORD` but never asked for `ADMIN_PASSWORD`,
+so it never wrote it to `/root/td-tokens.txt`.
+
+Layer 2 — `configure-apps.sh` and `setup-mattermost.sh` both prompted
+for `ADMIN_PASSWORD` interactively when it wasn't in tokens. Both used
+the prompted value in-memory for the current run but never wrote it
+back to `/root/td-tokens.txt` immediately. `configure-apps.sh`
+regenerates the tokens file wholesale via `write_summary()` at the END
+of a successful run — but if an earlier step crashes (Mattermost
+install, Homepage tile write, filebrowser dbconfig, etc.) the prompted
+password is silently lost. `setup-mattermost.sh` had no summary-write
+at all — it prompted, used the value in-memory, and moved on.
+
+That worked on the first install run because the prompted password was
+still in-memory when `setup-mattermost.sh` reached its config-PUT →
+re-login → bot-create sequence. But on ANY re-run against the existing
+CT (`EXISTING_CT=1`), tokens had `ADMIN_USER` + `ADMIN_EMAIL` but no
+password, the re-prompt fell into the same trap, and if the operator
+just hit Enter or the addon otherwise saw empty `ADMIN_PASSWORD` at
+the config-PUT step, the re-login POSTed
+`{"login_id":"…","password":""}` → 400 → empty session token → config
+PUT skipped → `EnableBotAccountCreation` never flipped → bot POST 403.
+
+The 403 error message from Mattermost (`api.bot.create_disabled`) points
+at the config; the true root cause is empty session token from empty
+password from prompt-without-persist.
+
+**Fix:**
+
+1. `sobol-public-bootstrap/boot.sh` — added `ADMIN_PASSWORD` to the
+   `tty_prompt` block with a 12-char minimum (matches Gitea/n8n/
+   filebrowser's strictest requirement) and appended
+   `upsert_token ADMIN_PASSWORD "$ADMIN_PASSWORD"` to the tokens-write
+   block. Now boot.sh persists all four credentials before any addon
+   runs.
+
+2. `sobol-foundation/addons/setup-mattermost.sh` — added local
+   `upsert_token` helper; wired it into each `ADMIN_USER`,
+   `ADMIN_EMAIL`, `ADMIN_PASSWORD` prompt so an interactively-collected
+   value gets written to tokens immediately. Also bumped the local
+   password minimum from 8 → 12 chars to match the rest of the stack.
+
+3. `sobol-foundation/automation/configure-apps.sh` — added
+   `_upsert_token_field` helper (naming matches existing
+   `_read_token_field`); wired it into `resolve_admin_user`,
+   `resolve_admin_email`, `resolve_admin_password`, and
+   `resolve_openrouter_key` so all interactively-collected secrets
+   persist before any downstream install step can fail. `write_summary`
+   still rewrites the whole file at end-of-run for canonical
+   formatting; the inline upserts are the fail-safe.
+
+**Files / Commit:**
+- `sobol-public-bootstrap/boot.sh` (ADMIN_PASSWORD prompt + upsert)
+- `sobol-foundation/addons/setup-mattermost.sh` (lines ~127-152 helper;
+  lines ~164-195 wired into prompts)
+- `sobol-foundation/automation/configure-apps.sh` (lines ~118-150
+  helper; four resolve_* functions wired)
+
+**Recovery on `creator`:** operator needs to either (a) rerun boot.sh
+end-to-end (destroys existing state), (b) edit `/root/td-tokens.txt`
+to add `ADMIN_PASSWORD=<the-pw-they-typed-during-install>` then rerun
+`setup-mattermost.sh` (idempotent — sees `EXISTING_CT=1`, does
+config PUT + bot create), or (c) reset the MM admin password via
+`/opt/mattermost/bin/mmctl user reset-password admin` then repeat (b)
+with the new value.
+
+**Related:** `2026-07-02 — CT can't resolve DNS…` (same install-day
+regression sweep). The install-debugging discipline codified in top-
+level `CLAUDE.md` — "fix the script, not the machine" — is what forced
+tracing this back through boot.sh instead of just adding `ADMIN_PASSWORD`
+manually on creator and moving on.
+
+---
+
 ## 2026-07-02 xx:xx CT — CT can't resolve DNS because its resolv.conf points at Tailscale MagicDNS from an unjoined CT
 
 **Symptom:** Real-hardware install of `setup-mattermost.sh` on `creator`

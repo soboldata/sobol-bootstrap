@@ -124,6 +124,30 @@ read_from_tokens() {
   awk -F= -v k="$key" '$1 == k { sub(/^[^=]*=/, "", $0); print; exit }' "$TOKENS_FILE"
 }
 
+# Persist a key=value pair to /root/td-tokens.txt. Strips any prior line for
+# the same key first so re-runs stay canonical. No-op if TOKENS_FILE doesn't
+# exist yet (the very first bootstrap-pve run creates it; addons re-append).
+# No-op on DRY_RUN.
+#
+# Why this exists: setup-mattermost.sh may be the FIRST addon a customer
+# runs (foundation stack orders it early). If boot.sh didn't collect a
+# credential (older shim) or the user ran a bare setup-mattermost.sh out
+# of tree, we still need any interactively-collected value to persist so
+# subsequent addon runs, the config PUT re-login, and downstream tools
+# (n8n / gitea / homepage) all see the same admin password. Otherwise the
+# 2nd run of ANY addon re-prompts, or downstream tools 401 with an empty
+# password field.
+upsert_token() {
+  local key="$1" val="$2"
+  (( DRY_RUN )) && return 0
+  [[ -f "$TOKENS_FILE" ]] || return 0
+  if grep -q "^${key}=" "$TOKENS_FILE"; then
+    sed -i "/^${key}=/d" "$TOKENS_FILE"
+  fi
+  printf '%s=%s\n' "$key" "$val" >> "$TOKENS_FILE"
+  chmod 600 "$TOKENS_FILE"
+}
+
 # ----- pre-flight: detect existing CT (skip create) or allocate new --------
 # The script is idempotent at the API-config level. If the CT already exists
 # we re-run just the auto-config phase against it (admin/team/bot/token/
@@ -169,6 +193,7 @@ if [[ -z "$ADMIN_USER" ]]; then
     printf "\n\033[1;36m[setup-mattermost]\033[0m Admin username (e.g. td): " >&2
     IFS= read -r ADMIN_USER
     [[ -n "$ADMIN_USER" ]] || die "Admin user can't be empty."
+    upsert_token ADMIN_USER "$ADMIN_USER"
   fi
 else
   log "Reusing admin user '$ADMIN_USER' from $TOKENS_FILE."
@@ -182,6 +207,7 @@ if [[ -z "$ADMIN_EMAIL" ]]; then
     printf "\n\033[1;36m[setup-mattermost]\033[0m Admin email: " >&2
     IFS= read -r ADMIN_EMAIL
     [[ -n "$ADMIN_EMAIL" ]] || die "Admin email can't be empty."
+    upsert_token ADMIN_EMAIL "$ADMIN_EMAIL"
   fi
 fi
 
@@ -190,9 +216,14 @@ if [[ -z "$ADMIN_PASSWORD" ]]; then
 fi
 if [[ -z "$ADMIN_PASSWORD" ]]; then
   if (( DRY_RUN )); then ADMIN_PASSWORD="dryrun-placeholder-pw"; else
-    printf "\n\033[1;36m[setup-mattermost]\033[0m Admin password (hidden; min 8 chars): " >&2
+    # Mattermost 10 minimum is 8, but every OTHER stack addon (Gitea,
+    # n8n, filebrowser) enforces 12+. Match the strictest so a single
+    # ADMIN_PASSWORD works across the whole foundation.
+    printf "\n\033[1;36m[setup-mattermost]\033[0m Admin password (hidden; min 12 chars — reused across Gitea/n8n): " >&2
     IFS= read -rs ADMIN_PASSWORD; echo >&2
-    [[ ${#ADMIN_PASSWORD} -ge 8 ]] || die "Password too short (need >= 8 chars)."
+    [[ ${#ADMIN_PASSWORD} -ge 12 ]] || die "Password too short (need >= 12 chars — must satisfy Gitea/n8n as well)."
+    upsert_token ADMIN_PASSWORD "$ADMIN_PASSWORD"
+    log "Persisted ADMIN_PASSWORD to $TOKENS_FILE for downstream addon re-use."
   fi
 fi
 

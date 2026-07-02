@@ -317,8 +317,16 @@ log "  CTID:           $CTID"
 log "  Resources:      $CPU cpu / $RAM MB RAM / $DISK GB disk"
 log "  Admin user:     $ADMIN_USER ($ADMIN_EMAIL)"
 log "  Team name:      $TEAM_NAME"
-log "  Tailscale:      $((( SKIP_TAILSCALE )) && echo skipped || echo yes (joining tailnet))"
-log "  Homepage tile:  $((( SKIP_HOMEPAGE_TILE )) && echo skipped || echo registered)"
+if (( SKIP_TAILSCALE )); then
+  log "  Tailscale:      skipped"
+else
+  log "  Tailscale:      yes (joining tailnet)"
+fi
+if (( SKIP_HOMEPAGE_TILE )); then
+  log "  Homepage tile:  skipped"
+else
+  log "  Homepage tile:  registered"
+fi
 log "================================================================"
 
 # ----- CT-creation phase (skipped when EXISTING_CT=1) ----------------------
@@ -506,15 +514,20 @@ c = json.load(sys.stdin)
 #     blocked here, leaving the entire automation chain broken.)
 #  3. RequireEmailVerification — turn off so future signups don't loop
 #     on email-confirm.
-#  4. SiteURL — clear to empty. Mattermost defaults this to the IP the
-#     installer used (http://<ct-ip>:8065). With a non-empty value, MM's
-#     WebSocket handler does Host/Origin validation against it, so any
-#     access via a different name (MagicDNS like 'mattermost:8065',
-#     Tailscale FQDN, reverse proxy) gets ws disconnects with err 1006
-#     and real-time updates stop. Empty SiteURL = trust the request.
-#     Safe inside a tailnet because access is already auth-gated.
-#     (Caught by user 2026-06-23 — magicdns access lost typing+live
-#     updates; CORS errors from mattermost-ai plugin against the IP.)
+#  4. SiteURL — set to the MagicDNS hostname (http://mattermost:8065).
+#     Mattermost 10 REMOVED the option to clear SiteURL (returns HTTP 400
+#     'api.config.update_config.clear_siteurl.app_error: Site URL cannot
+#     be cleared'). MM9 accepted empty = trust-the-request; MM10 does
+#     not. On MM 9 we cleared it so tailnet MagicDNS access wouldn't
+#     fail WebSocket Host validation. On MM 10 we set it to the tailnet
+#     hostname instead — which is stable across LAN/tailnet reboots
+#     because it's what MagicDNS gives every joined device. Trade-off:
+#     WebSocket clients accessing via the raw LAN IP (10.27.0.129:8065)
+#     will see a Host mismatch and downgrade to polling. That's fine
+#     because the customer default is tailnet access; the LAN IP path
+#     is only used as a bootstrap fallback.
+#     (User first hit this 2026-07-02 on real hardware; MM9 → MM10
+#     regression.)
 #  5. AllowCorsFrom — '*' so plugin AJAX calls (mattermost-ai etc.)
 #     don't trip CORS when accessed via a hostname different from
 #     SiteURL's recorded value.
@@ -536,7 +549,7 @@ c = json.load(sys.stdin)
 ss = c.setdefault('ServiceSettings', {})
 ss['EnableUserAccessTokens']     = True
 ss['EnableBotAccountCreation']   = True
-ss['SiteURL']                    = ''
+ss['SiteURL']                    = 'http://$HOSTNAME:8065'
 ss['AllowCorsFrom']              = '*'
 ss['WebsocketURL']               = ''
 ss['AllowedUntrustedInternalConnections'] = 'localhost 127.0.0.1 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 n8n ollama-pi-agent gitea openwebui homepage sandbox mattermost'

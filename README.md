@@ -24,24 +24,97 @@ etc.) and get written to `/root/td-tokens.txt` mode 0600.
 
 ## Usage
 
-**Non-interactive (recommended for scripting):**
+**Fastest path — pre-populate the tokens file via `scp`:**
+
+Best for testing and for install patterns where you don't want the
+tokens leaving your workstation over the public internet.
+
+```bash
+# On your workstation
+scp tokens.txt root@<pve-ip>:/root/td-tokens.txt
+
+# SSH in and run boot.sh
+ssh root@<pve-ip>
+curl -fsSL https://raw.githubusercontent.com/soboldata/sobol-bootstrap/main/boot.sh | bash
+```
+
+`boot.sh` detects the pre-existing `/root/td-tokens.txt`, loads every
+`KEY` from it into the env, and skips every prompt whose value is in
+the file. No URL, no PAT, no network dependency between the PVE box
+and your credential store.
+
+**Alternative — fetch a pre-populated tokens file over HTTPS or LAN:**
+
+Host a `tokens.txt` at a URL boot.sh can reach *before* Tailscale is
+up. Options that work:
+
+- **Local Gitea over LAN** — private repo, raw endpoint, PAT header.
+  URL like `http://<your-gitea-lan-ip>:3000/td/td-tokens/raw/branch/main/td-tokens.txt`.
+  Works when the PVE box is on the same LAN as your Gitea host.
+  (Gitea doesn't have first-class Gists — a private repo with a
+  raw endpoint gives the same effect.)
+- **GitHub private repo raw** — for pilot customers.
+- **GitHub secret gist** — unguessable URL, no auth. OK for quick
+  testing; less durable than a repo since gists can leak in search.
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/soboldata/sobol-bootstrap/main/boot.sh | bash
+```
+
+Paste the tokens URL at the first prompt. `boot.sh` fetches it, drops
+it into `/root/td-tokens.txt`, exports the keys, and skips every
+prompt whose value is in the file. Missing keys still get prompted.
+
+Private repo (Gitea, GitHub, whatever)? Add a PAT — same header
+format everywhere:
+
+```bash
+TOKENS_URL='http://<your-gitea-lan-ip>:3000/td/td-tokens/raw/branch/main/td-tokens.txt' \
+TOKENS_URL_TOKEN=<gitea_or_github_PAT> \
+curl -fsSL https://raw.githubusercontent.com/soboldata/sobol-bootstrap/main/boot.sh | bash
+```
+
+**Fully manual (env vars per credential):**
 
 ```bash
 TS_AUTHKEY=tskey-auth-xxxx \
 SSH_PUBKEY="$(cat ~/.ssh/id_ed25519.pub)" \
 CT_PASSWORD='strongpass-12chars-min' \
 ADMIN_EMAIL='you@example.com' \
+ADMIN_PASSWORD='stackadmin-12chars-min' \
 curl -fsSL https://raw.githubusercontent.com/soboldata/sobol-bootstrap/main/boot.sh | bash
 ```
 
-**Interactive (for humans):**
+**Interactive (humans, one prompt per missing value):**
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/soboldata/sobol-bootstrap/main/boot.sh | bash
 ```
 
-You'll be prompted for the four values above; each prompt reads from
-`/dev/tty` so it works even under `curl | bash`.
+Press Enter at the tokens-URL prompt to skip the fetch and type each
+credential by hand. Every prompt reads from `/dev/tty` so it works
+even under `curl | bash`.
+
+### Tokens file format
+
+Plain `KEY=value` per line. Blank lines and `# comment` lines are
+ignored. Recognized keys (all optional — missing ones prompt):
+
+```
+TS_AUTHKEY=tskey-auth-...
+TS_HOSTNAME=creator
+SSH_PUBKEY=ssh-ed25519 AAAA... you@workstation
+CT_PASSWORD=root-pw-for-CTs-12chars-min
+ADMIN_EMAIL=you@example.com
+ADMIN_USER=admin
+ADMIN_PASSWORD=stack-admin-pw-12chars-min
+```
+
+Values may be optionally quoted with `"` or `'`; CRLF line endings
+get stripped. Keep the file `chmod 600` on the host and treat the URL
+as sensitive. For a testing gist, unlisted-with-hash is fine; for
+anything customer-facing, use a private repo + PAT until the
+encrypted-intake path lands.
 
 ## What boot.sh does
 

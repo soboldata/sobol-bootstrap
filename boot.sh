@@ -22,24 +22,58 @@
 # Usage
 # ------------------------------------------------------------------
 #
-# Non-interactive (recommended for scripting):
+# Fastest path (pre-populated tokens file — no network fetch):
+#
+#   # From your workstation:
+#   scp tokens.txt root@<pve-ip>:/root/td-tokens.txt
+#   ssh root@<pve-ip>
+#   curl -fsSL https://raw.githubusercontent.com/soboldata/sobol-bootstrap/main/boot.sh | bash
+#
+# boot.sh detects the file, loads every KEY from it, and skips every
+# prompt whose value is already in the file.
+#
+# Fastest network path (fetch tokens from HTTPS or LAN URL):
+#
+#   curl -fsSL https://raw.githubusercontent.com/soboldata/sobol-bootstrap/main/boot.sh | bash
+#     → paste a URL at the prompt (e.g. Gitea raw, secret gist, private repo)
+#
+# Or non-interactively with the URL in env:
+#
+#   TOKENS_URL='http://<your-gitea-lan-ip>:3000/td/td-tokens/raw/branch/main/td-tokens.txt' \
+#   TOKENS_URL_TOKEN=<gitea_or_github_pat> \
+#   curl -fsSL https://raw.githubusercontent.com/soboldata/sobol-bootstrap/main/boot.sh | bash
+#
+# Private-repo raw URL adds one more env var:
+#
+#   TOKENS_URL='https://raw.githubusercontent.com/you/private-repo/main/tokens.txt' \
+#   TOKENS_URL_TOKEN=ghp_yourPAT... \
+#   curl -fsSL https://raw.githubusercontent.com/soboldata/sobol-bootstrap/main/boot.sh | bash
+#
+# Fully manual (one prompt per credential):
 #
 #   TS_AUTHKEY=tskey-auth-... \
 #   SSH_PUBKEY="$(cat ~/.ssh/id_ed25519.pub)" \
 #   CT_PASSWORD='strongpass' \
 #   ADMIN_EMAIL='you@example.com' \
+#   ADMIN_PASSWORD='stackadminpw' \
 #   curl -fsSL https://raw.githubusercontent.com/soboldata/sobol-bootstrap/main/boot.sh | bash
 #
-# Interactive (for humans, one prompt per missing value):
+# Interactive (humans, one prompt per missing value):
 #
 #   curl -fsSL https://raw.githubusercontent.com/soboldata/sobol-bootstrap/main/boot.sh | bash
+#
+# Expected keys in a tokens file (any subset works — missing keys prompt):
+#   TS_AUTHKEY, TS_HOSTNAME, SSH_PUBKEY, CT_PASSWORD,
+#   ADMIN_EMAIL, ADMIN_USER, ADMIN_PASSWORD
 #
 # Optional env vars:
-#   TS_HOSTNAME     Hostname to register on the tailnet (defaults to `hostname -s`)
-#   SOBOL_REPO_URL  Public repo URL (default: https://github.com/soboldata/sobol-bootstrap.git)
-#   SOBOL_REPO_DIR  Local checkout dir (default: /root/sobol-foundation)
-#   STACK           Stack to install (default: sobol-foundation)
-#                   Set to 'none' to stop after tailnet-join + repo clone
+#   TOKENS_URL       Pre-populated tokens file to fetch (public HTTPS)
+#   TOKENS_URL_TOKEN Optional PAT/bearer for private repos (auto-prompted on 401/404)
+#   TS_HOSTNAME      Hostname to register on the tailnet (defaults to `hostname -s`)
+#   SOBOL_REPO_URL   Public repo URL (default: https://github.com/soboldata/sobol-bootstrap.git)
+#   SOBOL_REPO_DIR   Local checkout dir (default: /root/sobol-foundation)
+#   STACK            Stack to install (default: sobol-foundation)
+#                    Set to 'none' to stop after tailnet-join + repo clone
 #
 # ------------------------------------------------------------------
 
@@ -138,10 +172,110 @@ log "Installing curl + ca-certificates + gnupg..."
 DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
   curl ca-certificates gnupg >/dev/null
 
-# ----- 3. Collect credentials ---------------------------------------
+# ----- 3. Populate /root/td-tokens.txt (three paths, all optional) --
+# Fast paths for testing and future customer installs:
+#
+#   A. Pre-existing /root/td-tokens.txt on the host
+#      (operator scp'd it before running boot.sh — no network needed)
+#   B. Fetch from public HTTPS URL (TOKENS_URL)
+#      Recommended hosts:
+#        - GitHub secret gist       (unguessable URL, no auth) — testing
+#        - GitHub private repo raw  (requires PAT)             — pilot
+#        - Gitea private repo raw   (requires PAT, LAN-reachable)
+#        - (future) encrypted blob + decryption key            — intake
+#   C. Interactive prompts (blank URL, no pre-existing file)
+#
+# Any KEY loaded from A or B skips its prompt below. Missing keys still
+# prompt interactively, so partial tokens files work — put TS_AUTHKEY
+# + ADMIN_* in the file, type SSH_PUBKEY at the terminal, etc.
+#
+# Path A takes precedence: if /root/td-tokens.txt already exists, we
+# don't even prompt for the URL (unless TOKENS_URL is set in env, in
+# which case we fetch and MERGE by re-installing the fetched file).
+
+# --- Path A detection ---
+if [[ -f /root/td-tokens.txt && -s /root/td-tokens.txt ]] && [[ -z "${TOKENS_URL+x}" ]]; then
+  log "Found pre-existing /root/td-tokens.txt — loading values from it."
+  log "  (To fetch a URL instead, set TOKENS_URL=... in env or delete the file.)"
+  awk -F= '/^[A-Z_][A-Z0-9_]*=/ {
+    n = length(substr($0, index($0,"=")+1))
+    printf "    %s = <%d chars>\n", $1, n
+  }' /root/td-tokens.txt >&2
+  # Mark the URL prompt as "already decided" so the next block skips it.
+  TOKENS_URL=""
+fi
+
+# --- Path B: URL fetch (skipped if TOKENS_URL is set to empty) ---
+# Only prompt for the URL if it wasn't set explicitly in env AND we
+# didn't already load from a pre-existing file.
+if [[ -z "${TOKENS_URL+x}" ]] && [[ -r /dev/tty ]]; then
+  printf "\n\033[1;36m[sobol-boot]\033[0m Pre-populated tokens URL (blank for interactive): " >/dev/tty
+  read -r TOKENS_URL </dev/tty || TOKENS_URL=""
+fi
+
+if [[ -n "${TOKENS_URL:-}" ]]; then
+  log "Fetching tokens from $TOKENS_URL..."
+
+  # Optional bearer/PAT for private-repo case. GitHub raw honors both
+  # 'token X' and 'Bearer X' — we send 'Bearer' since it's the more
+  # widely-portable header form.
+  auth_args=()
+  if [[ -n "${TOKENS_URL_TOKEN:-}" ]]; then
+    auth_args=(-H "Authorization: Bearer $TOKENS_URL_TOKEN")
+  fi
+
+  http_code="$(curl -sSL -o /tmp/tokens.fetched -w '%{http_code}' "${auth_args[@]}" "$TOKENS_URL" || echo 000)"
+
+  # Auth challenge → prompt for token, retry once. GitHub returns 404
+  # (not 401) for private-repo raw URLs without auth, so catch both.
+  if [[ ( "$http_code" == "401" || "$http_code" == "404" ) && -z "${TOKENS_URL_TOKEN:-}" ]]; then
+    warn "  Fetch returned HTTP $http_code — may need auth for a private repo."
+    TOKENS_URL_TOKEN="$(tty_prompt TOKENS_URL_TOKEN "PAT / bearer token for tokens URL (input hidden): " -s)"
+    http_code="$(curl -sSL -o /tmp/tokens.fetched -w '%{http_code}' \
+      -H "Authorization: Bearer $TOKENS_URL_TOKEN" "$TOKENS_URL" || echo 000)"
+  fi
+
+  [[ "$http_code" == "200" ]] || die "Failed to fetch $TOKENS_URL (HTTP $http_code)."
+
+  # Sanity: at least one KEY=value line, or this is garbage / an HTML
+  # error page returned with a 200 (happens with misconfigured gists).
+  grep -qE '^[A-Z_][A-Z0-9_]*=' /tmp/tokens.fetched \
+    || die "Fetched file doesn't look like a tokens file (no KEY=value lines). First 3 lines:
+$(head -3 /tmp/tokens.fetched | sed 's/^/    /')"
+
+  install -m 0600 /tmp/tokens.fetched /root/td-tokens.txt
+  rm -f /tmp/tokens.fetched
+
+  # Show what came through, redacted — value length only, never contents
+  log "Tokens installed to /root/td-tokens.txt. Keys present:"
+  awk -F= '/^[A-Z_][A-Z0-9_]*=/ {
+    n = length(substr($0, index($0,"=")+1))
+    printf "    %s = <%d chars>\n", $1, n
+  }' /root/td-tokens.txt >&2
+fi
+
+# --- Common: export every KEY from tokens file into env so tty_prompt ---
+# below sees them and skips prompting. This block runs for both Path A
+# (pre-existing file) and Path B (URL fetch), which both end with a
+# valid /root/td-tokens.txt in place. Safer than `. /root/td-tokens.txt`
+# (which would break on values containing # or unquoted whitespace).
+if [[ -f /root/td-tokens.txt && -s /root/td-tokens.txt ]]; then
+  while IFS='=' read -r _key _val; do
+    [[ "$_key" =~ ^[A-Z_][A-Z0-9_]*$ ]] || continue
+    # Strip CR (Windows line endings) and optional surrounding quotes
+    _val="${_val%$'\r'}"
+    _val="${_val%\"}"; _val="${_val#\"}"
+    _val="${_val%\'}"; _val="${_val#\'}"
+    export "$_key"="$_val"
+  done < /root/td-tokens.txt
+  unset _key _val
+fi
+
+# ----- 4. Collect credentials (prompts skip anything already in env) -
 # All prompts read from /dev/tty so this works under `curl | bash`.
-# If the operator set env vars, we use those and skip the prompt.
-log "Collecting credentials (env vars are used when set; otherwise prompts)..."
+# If the operator set env vars OR fetched a tokens file above, we use
+# those values and skip the prompt.
+log "Collecting credentials (fetched/env values are used when set; otherwise prompts)..."
 
 TS_AUTHKEY="$(tty_prompt TS_AUTHKEY "Tailscale REUSABLE auth key (tskey-auth-...): " -s)"
 [[ "$TS_AUTHKEY" =~ ^tskey-(auth|client)- ]] || \
@@ -161,7 +295,16 @@ CT_PASSWORD="$(tty_prompt CT_PASSWORD "Root password for CTs (12+ chars): " -s)"
 ADMIN_EMAIL="$(tty_prompt ADMIN_EMAIL "Admin email (for stack admin accounts + alerts): ")"
 [[ "$ADMIN_EMAIL" == *"@"* ]] || die "ADMIN_EMAIL doesn't look like an email."
 
-# ----- 4. Install Tailscale -----------------------------------------
+# ADMIN_PASSWORD is the password for admin accounts INSIDE the stack apps
+# (Mattermost, Gitea, n8n, etc.). Separate from CT_PASSWORD (which is the
+# root password for the LXCs themselves). Downstream addons that create
+# these admin accounts read this from tokens; without it in the file,
+# they'd prompt during install AND fail to persist the value, leaving
+# re-runs unable to authenticate. So we collect it here upfront.
+ADMIN_PASSWORD="$(tty_prompt ADMIN_PASSWORD "Password for STACK admin accounts (Mattermost, Gitea, n8n; 12+ chars): " -s)"
+[[ "${#ADMIN_PASSWORD}" -ge 12 ]] || die "ADMIN_PASSWORD must be at least 12 chars (Mattermost enforces this)."
+
+# ----- 5. Install Tailscale -----------------------------------------
 if command -v tailscale >/dev/null 2>&1; then
   log "Tailscale already installed — will re-authenticate with the provided key."
 else
@@ -169,7 +312,7 @@ else
   curl -fsSL https://tailscale.com/install.sh | sh
 fi
 
-# ----- 5. Join the tailnet ------------------------------------------
+# ----- 6. Join the tailnet ------------------------------------------
 TS_HOSTNAME="${TS_HOSTNAME:-$(hostname -s)}"
 log "Joining tailnet as '$TS_HOSTNAME'..."
 tailscale up \
@@ -188,7 +331,7 @@ done
 [[ -n "$TS_IP" ]] || die "Tailscale up succeeded but no tailnet IP after 30s"
 log "  Tailnet IP: $TS_IP"
 
-# ----- 6. MagicDNS health check (informational only) ----------------
+# ----- 7. MagicDNS health check (informational only) ----------------
 # On a brand-new customer tailnet, there's no gitea yet — that's what
 # we're about to install. So this check is just a sanity signal that
 # MagicDNS is working; not a prerequisite for the install to proceed.
@@ -201,13 +344,17 @@ else
   log "           (we're about to install it via the automation below)"
 fi
 
-# ----- 7. Write /root/td-tokens.txt ---------------------------------
+# ----- 8. Persist /root/td-tokens.txt -------------------------------
+# (If a tokens URL was fetched above, most keys are already in place —
+# this block upserts anything the operator supplied interactively OR
+# refreshes values that changed since the fetch. Upsert is idempotent.)
 log "Writing /root/td-tokens.txt (mode 0600)..."
 upsert_token TS_AUTHKEY     "$TS_AUTHKEY"
 upsert_token TS_HOSTNAME    "$TS_HOSTNAME"
 upsert_token CT_PASSWORD    "$CT_PASSWORD"
 upsert_token ADMIN_EMAIL    "$ADMIN_EMAIL"
 upsert_token ADMIN_USER     "${ADMIN_USER:-admin}"
+upsert_token ADMIN_PASSWORD "$ADMIN_PASSWORD"
 
 # Persist SSH pubkey to a real .pub file so bootstrap-pve.sh can consume it
 mkdir -p /root/.ssh
@@ -222,7 +369,7 @@ if ! grep -qFx "$SSH_PUBKEY" /root/.ssh/authorized_keys 2>/dev/null; then
 fi
 upsert_token SSHKEY_FILE    "/root/workstation.pub"
 
-# ----- 8. Fetch the install-time source ------------------------------
+# ----- 9. Fetch the install-time source ------------------------------
 # Chicken-and-egg: fresh customer install has no local Gitea (Gitea is
 # what we're ABOUT to install), so all install-time code has to come
 # from public GitHub. Clone the sobol-bootstrap repo which mirrors the
@@ -262,7 +409,7 @@ if [[ "$STACK" == "none" ]]; then
   exit 0
 fi
 
-# ----- 9. Run the three-phase installation ---------------------------
+# ----- 10. Run the three-phase installation --------------------------
 cd "$SOBOL_REPO_DIR"
 
 for s in bootstrap-pve.sh setup-ollama-pi.sh configure-apps.sh; do

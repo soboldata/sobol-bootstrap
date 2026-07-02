@@ -142,9 +142,17 @@ if [[ -z "$TOKENS_FILE" ]]; then
   done
 fi
 
-# Require yq for YAML parsing — it's the standard tool, install with apt
-command -v yq >/dev/null || die "yq required: apt install -y yq"
-command -v jq >/dev/null || die "jq required: apt install -y jq"
+# Require yq + jq for YAML/JSON parsing. Auto-install if missing so a
+# customer running this on fresh PVE doesn't hit "yq required" and stop.
+# Debian's `yq` is the Python jq-wrapper (kislyuk/yq) which supports the
+# `-r '.path'` syntax used throughout.
+for tool in yq jq; do
+  if ! command -v "$tool" >/dev/null 2>&1; then
+    log "$tool not found — installing via apt..."
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "$tool" >/dev/null 2>&1 \
+      || die "Failed to install $tool via apt. Install manually: apt install -y $tool"
+  fi
+done
 
 # ----- manifest reader helpers ---------------------------------------------
 # Each helper reads a single field from the manifest. Centralizes the yq

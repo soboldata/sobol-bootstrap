@@ -156,9 +156,115 @@ if (( ! UNINSTALL )); then
   fi
 fi
 
-# CT check
-pct status "$CLOUDFLARED_CTID" >/dev/null 2>&1 || \
-  die "CT $CLOUDFLARED_CTID not found. Create it first (community-scripts ct/debian.sh, small size)."
+# CT detection or auto-create — mirrors setup-postgres-shared.sh #267 pattern.
+CLOUDFLARED_HOSTNAME="${CLOUDFLARED_HOSTNAME:-cloudflared}"
+CLOUDFLARED_HELPER_URL="${CLOUDFLARED_HELPER_URL:-https://github.com/community-scripts/ProxmoxVE/raw/main/ct/cloudflared.sh}"
+TS_AUTHKEY_LOCAL="$(read_token TS_AUTHKEY || true)"
+CT_PASSWORD_LOCAL="$(read_token CT_PASSWORD || true)"
+
+# Source ct-helpers if available (ct_wait_ready, ts_ensure_joined)
+if [[ -r "$(dirname "${BASH_SOURCE[0]}")/lib/ct-helpers.sh" ]]; then
+  # shellcheck source=lib/ct-helpers.sh
+  source "$(dirname "${BASH_SOURCE[0]}")/lib/ct-helpers.sh"
+fi
+
+find_ct_by_hostname_local() {
+  local want="$1" c hn
+  for c in $(pct list 2>/dev/null | awk 'NR>1 {print $1}'); do
+    hn="$(pct config "$c" 2>/dev/null | awk '/^hostname:/ {print $2}')"
+    [[ "$hn" == "$want" ]] && { echo "$c"; return 0; }
+  done
+  return 1
+}
+
+EXISTING_CTID="$(find_ct_by_hostname_local "$CLOUDFLARED_HOSTNAME" 2>/dev/null || true)"
+if [[ -n "$EXISTING_CTID" ]]; then
+  log "  Found existing CT $EXISTING_CTID ($CLOUDFLARED_HOSTNAME) — using it."
+  CLOUDFLARED_CTID="$EXISTING_CTID"
+elif (( ! UNINSTALL )); then
+  log "  No CT named '$CLOUDFLARED_HOSTNAME' found — creating via community-scripts cloudflared.sh..."
+  [[ -n "$CT_PASSWORD_LOCAL" ]] || die "CT_PASSWORD required in $TOKENS_FILE to create a new CT."
+
+  # Auto-allocate CTID if the preferred one is taken
+  if pct status "$CLOUDFLARED_CTID" >/dev/null 2>&1; then
+    CLOUDFLARED_CTID="$(pvesh get /cluster/nextid 2>/dev/null | tr -d '"')"
+    log "  Preferred CTID taken; auto-allocated $CLOUDFLARED_CTID."
+  fi
+
+  # SSH pubkey pick from authorized_keys (skip PVE auto-generated)
+  PVE_HOST="$(hostname -s)"
+  SSH_KEY=""
+  [[ -f /root/.ssh/authorized_keys ]] && \
+    SSH_KEY="$(awk -v skip="root@$PVE_HOST" '/^ssh-/ && $NF != skip { print; exit }' /root/.ssh/authorized_keys)"
+
+  # Fetch helper to tempfile (fail-loud if 404)
+  HELPER_TMP="$(mktemp /tmp/cf-helper.XXXXXX.sh)"
+  if ! curl -fsSL "$CLOUDFLARED_HELPER_URL" -o "$HELPER_TMP" || [[ ! -s "$HELPER_TMP" ]]; then
+    rm -f "$HELPER_TMP"
+    die "Cloudflared helper fetch failed or returned empty. URL: $CLOUDFLARED_HELPER_URL
+  Check community-scripts current layout: https://community-scripts.github.io/ProxmoxVE/scripts
+  Override with: CLOUDFLARED_HELPER_URL=<url> $0"
+  fi
+
+  var_ctid="$CLOUDFLARED_CTID" \
+  var_hostname="$CLOUDFLARED_HOSTNAME" \
+  var_ssh=yes \
+  var_ssh_authorized_key="$SSH_KEY" \
+  var_gpu=no \
+  bash "$HELPER_TMP"
+  rm -f "$HELPER_TMP"
+
+  # Detect actual CTID
+  ACTUAL_CTID="$(find_ct_by_hostname_local "$CLOUDFLARED_HOSTNAME" 2>/dev/null || true)"
+  if [[ -n "$ACTUAL_CTID" && "$ACTUAL_CTID" != "$CLOUDFLARED_CTID" ]]; then
+    log "  Helper assigned CTID $ACTUAL_CTID — switching."
+    CLOUDFLARED_CTID="$ACTUAL_CTID"
+  fi
+  [[ -n "$CLOUDFLARED_CTID" ]] || die "Cloudflared CT didn't come up — see community-scripts output above."
+  # Persist for future runs
+  if grep -q "^CLOUDFLARED_CTID=" "$TOKENS_FILE" 2>/dev/null; then
+    sed -i "s|^CLOUDFLARED_CTID=.*|CLOUDFLARED_CTID=$CLOUDFLARED_CTID|" "$TOKENS_FILE"
+  else
+    echo "CLOUDFLARED_CTID=$CLOUDFLARED_CTID" >> "$TOKENS_FILE"
+  fi
+
+  # TUN passthrough + reboot
+  CT_CONF="/etc/pve/lxc/$CLOUDFLARED_CTID.conf"
+  if ! grep -q "/dev/net/tun" "$CT_CONF" 2>/dev/null; then
+    log "  Adding /dev/net/tun passthrough..."
+    cat >> "$CT_CONF" <<'TUN_BLOCK'
+lxc.cgroup2.devices.allow: c 10:200 rwm
+lxc.mount.entry: /dev/net/tun dev/net/tun none bind,create=file
+TUN_BLOCK
+    pct reboot "$CLOUDFLARED_CTID"
+    log "  Waiting for CT to come back after reboot..."
+    declare -F ct_wait_ready >/dev/null && ct_wait_ready "$CLOUDFLARED_CTID" || sleep 15
+  fi
+
+  # Tailscale install + join
+  if [[ -n "$TS_AUTHKEY_LOCAL" ]] && declare -F ts_ensure_joined >/dev/null; then
+    log "  Installing tailscale + joining tailnet as '$CLOUDFLARED_HOSTNAME'..."
+    if ! pct exec "$CLOUDFLARED_CTID" -- tailscale --version >/dev/null 2>&1; then
+      pct exec "$CLOUDFLARED_CTID" -- bash -lc '
+        set -e
+        export DEBIAN_FRONTEND=noninteractive
+        . /etc/os-release
+        apt-get update -qq
+        apt-get install -y -qq curl ca-certificates
+        curl -fsSL "https://pkgs.tailscale.com/stable/${ID}/${VERSION_CODENAME}.noarmor.gpg" \
+          | tee /usr/share/keyrings/tailscale-archive-keyring.gpg >/dev/null
+        echo "deb [signed-by=/usr/share/keyrings/tailscale-archive-keyring.gpg] https://pkgs.tailscale.com/stable/${ID} ${VERSION_CODENAME} main" \
+          > /etc/apt/sources.list.d/tailscale.list
+        apt-get update -qq
+        apt-get install -y -qq tailscale
+      ' 2>&1 | sed 's/^/    /'
+    fi
+    ts_ensure_joined "$CLOUDFLARED_CTID" "$TS_AUTHKEY_LOCAL" "$CLOUDFLARED_HOSTNAME" || \
+      warn "  Tailscale join returned non-zero — continuing."
+  fi
+fi
+
+# Final running check
 [[ "$(pct status "$CLOUDFLARED_CTID")" == *running* ]] || \
   { log "Starting CT $CLOUDFLARED_CTID..."; run "pct start $CLOUDFLARED_CTID"; sleep 3; }
 

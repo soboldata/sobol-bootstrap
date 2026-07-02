@@ -96,6 +96,79 @@ ADMIN_NOTIFY_EMAIL set. `--test-only` lets you verify without re-config.
 
 ## Entries
 
+## 2026-07-02 xx:xx CT — Re-running installer after deleting devices from tailnet admin panel leaves everything "installed but stale"
+
+**Symptom:** Operator did a first install, then deleted all the Sobol
+devices from the tailnet admin panel (accidentally, or as part of a
+"clean slate" reset). Re-ran boot.sh expecting the CTs to re-register.
+Instead, boot.sh + bootstrap-pve.sh + each addon reported "everything
+already installed, tailscale IP present, skipping" and the CTs never
+came back on the tailnet. `pct exec <ct> -- tailscale ip -4` still
+returned the old 100.x IP locally, but the devices weren't reachable
+tailnet-side.
+
+**Root cause:** The idempotent skip logic checks "does the local
+tailscaled report a 100.x IP?" — which is a good check for "was
+tailscale ever set up?" but a **bad** check for "is the device actually
+on the tailnet right now?" When a node is deleted admin-side, the
+local tailscaled keeps its cached nodekey and its old IP indefinitely,
+until it's forced to re-register.
+
+Standard `tailscale up --authkey=X` in that state is often a no-op —
+the local daemon sees "I'm already logged in with a valid session" and
+doesn't retry. Only `tailscale up --authkey=X --force-reauth` reliably
+generates a fresh nodekey and re-registers with the control server.
+
+**Fix:**
+
+1. **Self-heal in existing paths** (option A):
+   - `boot.sh` (PVE host tailscale-up): after the standard `tailscale
+     up`, wait 30s for a 100.x IP. If none, retry with `--force-reauth`.
+     Die with diagnostics if both fail.
+   - `automation/bootstrap-pve.sh` (per-CT tailscale-up in
+     `setup_tailscale_for_ct()`): same two-tier pattern. If standard
+     up doesn't yield an IP in 30s, retry with `--force-reauth`.
+     Continues install if a specific CT fails so other CTs still get
+     processed; operator recovers with the refresh addon.
+   - `addons/lib/ct-helpers.sh`: new `ts_ensure_joined()` helper
+     encapsulates the pattern for future addons to reuse (per CT or
+     for the host).
+
+2. **Explicit refresh addon** (option B):
+   - `addons/setup-tailnet-refresh.sh` — force-reauths every node in
+     the stack (PVE host + running CTs with tailscale installed).
+     Unlike the self-heal paths, this UNCONDITIONALLY force-reauths
+     even if the local tailscaled reports a valid IP — because the
+     operator explicitly said "I know the state is stale, rebuild
+     identities." Supports `--dry-run`, `--host-only`, `--cts-only`,
+     `--only <CTID>`, `--exclude <CTID>`.
+
+Self-heal catches the "no local IP" case automatically on re-run.
+The refresh addon is what the operator reaches for when the local
+state is misleadingly "valid" but tailnet-side is empty.
+
+**Files / Commit:**
+- `sobol-foundation/addons/lib/ct-helpers.sh` (adds `ts_ensure_joined`)
+- `sobol-foundation/automation/bootstrap-pve.sh` (per-CT two-tier up)
+- `sobol-public-bootstrap/boot.sh` (host two-tier up, mirrored)
+- `sobol-foundation/addons/setup-tailnet-refresh.sh` (new)
+- Same three files mirrored into `sobol-public-bootstrap/`
+
+**Recovery on an existing broken host:**
+```bash
+bash /root/sobol-foundation/addons/setup-tailnet-refresh.sh
+# or single node:
+bash /root/sobol-foundation/addons/setup-tailnet-refresh.sh --only 100
+```
+
+**Related:** the general "fix the script, not the machine" principle
+in top-level CLAUDE.md — this fix means a customer who accidentally
+deletes tailnet devices doesn't have to know about a special script.
+The installer just works. The refresh addon exists for the explicit
+"I know what I'm doing" case.
+
+---
+
 ## 2026-07-02 xx:xx CT — Mattermost bot creation 403'd because ADMIN_PASSWORD was prompted-but-not-persisted
 
 **Symptom:** Real-hardware install on `creator` completed the CT create +

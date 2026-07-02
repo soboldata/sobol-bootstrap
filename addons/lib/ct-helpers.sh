@@ -232,3 +232,110 @@ ct_ip() {
 ct_tailnet_ip() {
   pct exec "$1" -- tailscale ip -4 2>/dev/null | head -1
 }
+
+# ts_ensure_joined <ctid|"host"> <ts_authkey> [ts_hostname] [ts_extra_flags]
+# Idempotently ensure the target (a CT by ID, or the string "host" for the
+# PVE host itself) is currently on the tailnet AND has a working identity.
+#
+# Handles four states:
+#   1. Working: tailscale up, has an IP → no-op, returns 0
+#   2. Never joined: no IP, no session → runs `tailscale up --authkey`
+#   3. Stale nodekey (device deleted admin-side): `tailscale up` alone can
+#      succeed but no IP appears because the nodekey is dead → retries with
+#      --force-reauth
+#   4. Fully broken: even --force-reauth fails → returns 1 with diagnostics
+#
+# Why this exists: after an operator deletes a Tailscale device admin-side
+# (accidentally or intentionally), re-running the installer sees "tailscale
+# is installed" and doesn't force reauth. The local tailscaled still has
+# the cached (now-dead) nodekey. Standard `tailscale up --authkey` is often
+# ignored in that state — the control server has no record of this node.
+# Only `--force-reauth` reliably recovers.
+#
+# Called from: bootstrap-pve.sh (per CT after preflight), boot.sh (for the
+# PVE host itself — inlined there since it runs before this file is
+# clone-able), setup-tailnet-refresh.sh (force-reauth every node in the
+# stack), individual addons after they detect EXISTING_CT=1.
+#
+# Returns 0 on success (target is on tailnet with a valid IP).
+# Returns 1 if authkey isn't provided or all recovery attempts fail.
+ts_ensure_joined() {
+  local target="$1" authkey="${2:-}" hostname="${3:-}" extra_flags="${4:-}"
+  local exec_prefix label
+
+  if [[ "$target" == "host" ]]; then
+    exec_prefix=""
+    label="PVE host"
+  else
+    exec_prefix="pct exec $target --"
+    label="CT $target"
+  fi
+
+  # Step 1: is tailscale even installed on the target?
+  # (For CTs: bootstrap-pve.sh installs it via the tailscale add-on. For
+  # the host: boot.sh installs it via https://tailscale.com/install.sh.
+  # This helper only VERIFIES; it doesn't install.)
+  if ! $exec_prefix command -v tailscale >/dev/null 2>&1; then
+    warn "  $label: tailscale binary not installed — helper won't install, that's the caller's job"
+    return 1
+  fi
+
+  # Step 2: happy path — already on tailnet with a working IP
+  local ip
+  ip="$($exec_prefix tailscale ip -4 2>/dev/null | head -1 || true)"
+  if [[ -n "$ip" && "$ip" =~ ^100\. ]]; then
+    log "  $label already on tailnet as $ip — no rejoin needed"
+    return 0
+  fi
+
+  # Step 3: not on tailnet. Need an authkey to fix that.
+  if [[ -z "$authkey" ]]; then
+    warn "  $label not on tailnet, but no TS_AUTHKEY provided — can't rejoin"
+    return 1
+  fi
+
+  # Assemble the up command. --reset drops any old prefs (advertised routes,
+  # exit-node settings, etc.) so a re-join is clean. --accept-routes lets
+  # the node reach subnet-router-advertised destinations.
+  local up_cmd="tailscale up --authkey=$authkey --accept-routes --reset"
+  [[ -n "$hostname" ]] && up_cmd="$up_cmd --hostname=$hostname"
+  [[ -n "$extra_flags" ]] && up_cmd="$up_cmd $extra_flags"
+
+  log "  $label not on tailnet — attempting standard tailscale up..."
+  if $exec_prefix $up_cmd 2>&1 | sed 's/^/    /'; then
+    sleep 2
+    ip="$($exec_prefix tailscale ip -4 2>/dev/null | head -1 || true)"
+    if [[ -n "$ip" && "$ip" =~ ^100\. ]]; then
+      log "  ✓ $label joined tailnet as $ip"
+      return 0
+    fi
+  fi
+
+  # Step 4: standard up didn't yield an IP. Almost always means the local
+  # nodekey is stale (device was deleted admin-side, or authkey rotated).
+  # --force-reauth generates a fresh nodekey and re-registers with the
+  # control server.
+  warn "  $label: tailscale up didn't produce a tailnet IP."
+  warn "    Most common cause: this device was deleted from the tailnet admin"
+  warn "    panel, leaving a stale nodekey cached locally. Retrying with"
+  warn "    --force-reauth to generate a fresh identity..."
+
+  if $exec_prefix $up_cmd --force-reauth 2>&1 | sed 's/^/    /'; then
+    sleep 3
+    ip="$($exec_prefix tailscale ip -4 2>/dev/null | head -1 || true)"
+    if [[ -n "$ip" && "$ip" =~ ^100\. ]]; then
+      log "  ✓ $label force-rejoined tailnet as $ip"
+      return 0
+    fi
+  fi
+
+  # Truly broken. Give the operator specific commands to debug manually.
+  warn "  $label: --force-reauth also failed to yield a tailnet IP. Diagnose with:"
+  warn "    $exec_prefix tailscale status"
+  warn "    $exec_prefix tailscale netcheck"
+  warn "    $exec_prefix journalctl -u tailscaled --no-pager -n 50"
+  warn "  Manual recovery:"
+  warn "    $exec_prefix tailscale logout"
+  warn "    $exec_prefix tailscale up --authkey=<KEY> --hostname=$hostname --force-reauth"
+  return 1
+}

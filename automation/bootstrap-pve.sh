@@ -872,11 +872,65 @@ or pass it via flag: /root/bootstrap-pve.sh --tsauthkey tskey-auth-..."
   # retry to fail with "changing settings requires mentioning all
   # non-default flags". With --reset, every CT starts from a known clean
   # state on each attempt.
-  run "pct exec $CTID -- tailscale up --reset --authkey=$TS_AUTHKEY --hostname=$HOSTNAME --accept-routes \
-       || pct exec $CTID -- tailscale up --reset --authkey=$TS_AUTHKEY --hostname=$HOSTNAME"
+  #
+  # Two-tier join with --force-reauth fallback: if the standard up doesn't
+  # yield a tailnet IP within 30s, the local nodekey is almost certainly
+  # stale (device was deleted from the tailnet admin panel, or the authkey
+  # rotated). --force-reauth mints a fresh nodekey and re-registers with
+  # the control server. Without this, re-runs of bootstrap-pve.sh after
+  # tailnet-side device deletion leave CTs "already installed, tailscale
+  # binary present, no tailnet IP" and the installer silently skips them.
+  #
+  # This mirrors ts_ensure_joined() in addons/lib/ct-helpers.sh; the logic
+  # is inlined here (rather than sourced) so bootstrap-pve.sh stays
+  # standalone-runnable and doesn't pull in helper dependencies that
+  # could drift between the addons/ tree and the automation/ tree.
+  if (( DRY_RUN )); then
+    log "  [dry-run] would tailscale up (with --force-reauth fallback)"
+  else
+    # Attempt 1: standard up
+    pct exec "$CTID" -- tailscale up \
+      --reset --authkey="$TS_AUTHKEY" --hostname="$HOSTNAME" --accept-routes 2>&1 \
+      | sed 's/^/    /' || true
 
-  # Show the 100.x for our final summary.
-  run "pct exec $CTID -- tailscale ip -4 || true"
+    # Check for tailnet IP
+    local TS_IP=""
+    for i in $(seq 1 30); do
+      TS_IP="$(pct exec "$CTID" -- tailscale ip -4 2>/dev/null | head -1 || true)"
+      [[ -n "$TS_IP" && "$TS_IP" =~ ^100\. ]] && break
+      sleep 1
+    done
+
+    # Attempt 2: force-reauth if no IP yet
+    if [[ -z "$TS_IP" || ! "$TS_IP" =~ ^100\. ]]; then
+      warn "  CT $CTID ($HOSTNAME): standard tailscale up didn't yield a tailnet IP."
+      warn "    Most common cause: this device was deleted from the tailnet admin"
+      warn "    panel, leaving a stale nodekey cached locally. Retrying with"
+      warn "    --force-reauth to generate a fresh identity..."
+      pct exec "$CTID" -- tailscale up \
+        --reset --authkey="$TS_AUTHKEY" --hostname="$HOSTNAME" --accept-routes --force-reauth 2>&1 \
+        | sed 's/^/    /' || true
+      for i in $(seq 1 30); do
+        TS_IP="$(pct exec "$CTID" -- tailscale ip -4 2>/dev/null | head -1 || true)"
+        [[ -n "$TS_IP" && "$TS_IP" =~ ^100\. ]] && break
+        sleep 1
+      done
+    fi
+
+    if [[ -n "$TS_IP" && "$TS_IP" =~ ^100\. ]]; then
+      log "  ✓ CT $CTID ($HOSTNAME) on tailnet as $TS_IP"
+    else
+      warn "  CT $CTID ($HOSTNAME): tailscale up + --force-reauth both failed."
+      warn "    Debug: pct exec $CTID -- tailscale status"
+      warn "           pct exec $CTID -- journalctl -u tailscaled --no-pager -n 50"
+      warn "    Manual recovery:"
+      warn "           pct exec $CTID -- tailscale logout"
+      warn "           pct exec $CTID -- tailscale up --authkey=<KEY> --hostname=$HOSTNAME --force-reauth"
+      # Don't die — let the rest of the install proceed. Other CTs may
+      # come up fine, and the operator can retry this one with
+      # setup-tailnet-refresh.sh.
+    fi
+  fi
 }
 
 # ----- driver ----------------------------------------------------------------

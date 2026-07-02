@@ -313,22 +313,59 @@ else
 fi
 
 # ----- 6. Join the tailnet ------------------------------------------
+# Two-tier join: try standard `tailscale up` first (fast, safe). If it
+# doesn't produce a tailnet IP within 30s, the local nodekey is stale
+# (usually because this device was deleted from the tailnet admin panel
+# on a prior run) — retry with --force-reauth to generate a fresh
+# identity. This mirrors ts_ensure_joined() in addons/lib/ct-helpers.sh
+# (which handles the same recovery for CTs). Inlined here because
+# ct-helpers.sh lives in the private repo we haven't cloned yet.
 TS_HOSTNAME="${TS_HOSTNAME:-$(hostname -s)}"
 log "Joining tailnet as '$TS_HOSTNAME'..."
+
+# Attempt 1: standard up
 tailscale up \
   --authkey="$TS_AUTHKEY" \
   --hostname="$TS_HOSTNAME" \
   --accept-routes \
-  --reset
+  --reset 2>&1 | sed 's/^/    /' || true
 
-# Wait for a Tailnet IPv4 (means we're connected + assigned)
+# Wait up to 30s for a tailnet IPv4
 TS_IP=""
 for i in $(seq 1 30); do
   TS_IP="$(tailscale ip -4 2>/dev/null | head -1 || true)"
-  [[ -n "$TS_IP" ]] && break
+  [[ -n "$TS_IP" && "$TS_IP" =~ ^100\. ]] && break
   sleep 1
 done
-[[ -n "$TS_IP" ]] || die "Tailscale up succeeded but no tailnet IP after 30s"
+
+# Attempt 2: force-reauth if standard up didn't yield an IP
+if [[ -z "$TS_IP" ]]; then
+  warn "  Standard tailscale up didn't produce a tailnet IP within 30s."
+  warn "  Most common cause: this device was previously deleted from the"
+  warn "  tailnet admin panel, leaving a stale nodekey cached locally."
+  warn "  Retrying with --force-reauth to generate a fresh identity..."
+
+  tailscale up \
+    --authkey="$TS_AUTHKEY" \
+    --hostname="$TS_HOSTNAME" \
+    --accept-routes \
+    --reset \
+    --force-reauth 2>&1 | sed 's/^/    /' || true
+
+  for i in $(seq 1 30); do
+    TS_IP="$(tailscale ip -4 2>/dev/null | head -1 || true)"
+    [[ -n "$TS_IP" && "$TS_IP" =~ ^100\. ]] && break
+    sleep 1
+  done
+fi
+
+[[ -n "$TS_IP" && "$TS_IP" =~ ^100\. ]] \
+  || die "Tailscale up failed to yield a tailnet IP even with --force-reauth. Debug:
+    tailscale status
+    tailscale netcheck
+    journalctl -u tailscaled --no-pager -n 50
+  Manual recovery:
+    tailscale logout && tailscale up --authkey=<KEY> --hostname=$TS_HOSTNAME --force-reauth"
 log "  Tailnet IP: $TS_IP"
 
 # ----- 7. MagicDNS health check (informational only) ----------------

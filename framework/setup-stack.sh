@@ -483,6 +483,7 @@ install_required_features() {
     [port80_redirect]="setup-port80-redirect.sh"
     [smb_share]="setup-smb-share.sh"
     [new_pi_agent]="setup-new-pi-agent.sh"
+    [cloudflared_tunnel]="setup-cloudflared.sh"
   )
 
   local ran=0
@@ -507,9 +508,14 @@ install_required_features() {
     if (( DRY_RUN )); then
       printf "[dry-run] %s%s\n" "$addon_path" "${TOKENS_FILE:+ --tokens-file $TOKENS_FILE}"
     else
-      "$addon_path" ${TOKENS_FILE:+--tokens-file "$TOKENS_FILE"} 2>&1 | sed 's/^/    /'
+      "$addon_path" ${TOKENS_FILE:+--tokens-file "$TOKENS_FILE"} 2>&1 | sed 's/^/    /' || \
+        warn "    Feature '$feat' addon exited non-zero — continuing."
     fi
-    ((ran++))
+    # Pre-increment: ((++ran)) returns exit 0 when the new value is non-zero.
+    # Post-increment ((ran++)) returns non-zero when the OLD value is 0 —
+    # under set -e that silently aborts the whole install after the first
+    # feature. Classic bash gotcha. Also swallow with || true to be extra safe.
+    ((++ran)) || true
   done < <(yq -r '.features | keys | .[]' "$MANIFEST")
 
   log "  Ran $ran required feature(s)."
@@ -538,7 +544,7 @@ install_core_apps() {
     case "$action" in
       SKIP)
         log "  [SKIP]        $app (already at target state)"
-        ((skip_count++))
+        ((++skip_count))
         ;;
       RECONFIGURE|INSTALL)
         if [[ -z "$script" ]]; then
@@ -557,7 +563,7 @@ install_core_apps() {
             }
           fi
         fi
-        [[ "$action" == "INSTALL" ]] && ((install_count++)) || ((reconfigure_count++))
+        [[ "$action" == "INSTALL" ]] && ((++install_count)) || ((++reconfigure_count))
         ;;
     esac
   done
@@ -593,7 +599,7 @@ install_optional_apps() {
       "$script" ${TOKENS_FILE:+--tokens-file "$TOKENS_FILE"} 2>&1 | sed 's/^/    /' || \
         warn "  $app returned non-zero"
     fi
-    ((count++))
+    ((++count))
   done < <(m_arr '.optional_apps')
 
   log "  Ran $count optional app(s)."
@@ -620,7 +626,7 @@ import_workflows() {
     # Library workflow — already imported at foundation install
     if [[ -f "$SOBOL_FOUNDATION_PATH/addons/n8n/workflows/${wf}.json" ]]; then
       log "  [LIB]  $wf (imported at foundation install by setup-n8n.sh)"
-      ((skipped++))
+      ((++skipped))
       continue
     fi
     # Stack-specific workflow
@@ -634,7 +640,7 @@ import_workflows() {
       log "  [STACK] $wf (would POST to n8n — MVP: manual import required)"
       # TODO: real n8n API POST — needs N8N_HOST + N8N_OWNER_EMAIL +
       # N8N_OWNER_PASSWORD from td-tokens. Not exercised yet.
-      ((imported++))
+      ((++imported))
     else
       local missing
       missing="$(workflow_deps_satisfied "$wf_path" "$installed" || true)"
@@ -665,7 +671,7 @@ deploy_default_personas() {
       "$PI_PERSONAS_PATH/deploy-persona.sh" "$p" 2>&1 | sed 's/^/    /' || \
         warn "  Persona '$p' deploy returned non-zero"
     fi
-    ((count++))
+    ((++count))
   done < <(m_arr '.default_personas')
 
   log "  Deployed $count default persona(s)."

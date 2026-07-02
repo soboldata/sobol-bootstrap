@@ -45,12 +45,13 @@ set -Eeuo pipefail
 # ----- args --------------------------------------------------------------
 DRY_RUN=0
 REDO_PASSWORDS=0
-TOKENS_FILE="/root/studio-tokens.txt"
+TOKENS_FILE=""    # resolved below — accepts --tokens-file or auto-detects
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --dry-run)         DRY_RUN=1; shift ;;
     --redo-passwords)  REDO_PASSWORDS=1; shift ;;
+    --tokens-file)     TOKENS_FILE="$2"; shift 2 ;;
     -h|--help)         sed -n '2,30p' "$0"; exit 0 ;;
     *) echo "Unknown arg: $1" >&2; exit 2 ;;
   esac
@@ -64,7 +65,21 @@ run()  { if (( DRY_RUN )); then printf "[dry-run] %s\n" "$*"; else eval "$@"; fi
 
 [[ $EUID -eq 0 ]] || die "Run as root on the PVE host."
 command -v pct >/dev/null || die "pct not found — PVE host required."
-[[ -f "$TOKENS_FILE" ]] || die "$TOKENS_FILE missing — run bootstrap-pve.sh first."
+
+# Resolve tokens file. --tokens-file wins; else auto-detect in order:
+#   /root/studio-tokens.txt   (legacy, when creator-studio was studio-stack)
+#   /root/td-tokens.txt       (foundation — most common)
+#   /root/sobol-tokens.txt    (Sobol Mirror overlay)
+# Matches setup-stack.sh's tokens-file resolution order.
+if [[ -z "$TOKENS_FILE" ]]; then
+  for f in /root/studio-tokens.txt /root/td-tokens.txt /root/sobol-tokens.txt; do
+    if [[ -f "$f" ]]; then TOKENS_FILE="$f"; break; fi
+  done
+fi
+[[ -n "$TOKENS_FILE" && -f "$TOKENS_FILE" ]] \
+  || die "No tokens file found. Tried /root/studio-tokens.txt, /root/td-tokens.txt, /root/sobol-tokens.txt.
+  Pass --tokens-file <path> explicitly, or run bootstrap-pve.sh first."
+log "Using tokens file: $TOKENS_FILE"
 
 # read_token — last-match wins, placeholder values rejected
 read_token() {

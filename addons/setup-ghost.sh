@@ -47,7 +47,12 @@ DRY_RUN=0
 SKIP_ADMIN_SETUP=0
 SKIP_WEBHOOK=0
 WEBHOOK_ONLY=0
-TOKENS_FILE="/root/studio-tokens.txt"
+# Auto-detect tokens file. --tokens-file arg (below) overrides.
+TOKENS_FILE=""
+for _tokf in /root/studio-tokens.txt /root/td-tokens.txt /root/sobol-tokens.txt; do
+  [[ -f "$_tokf" ]] && { TOKENS_FILE="$_tokf"; break; }
+done
+unset _tokf
 
 while [[ $# -gt 0 ]]; do
   case "$1" in

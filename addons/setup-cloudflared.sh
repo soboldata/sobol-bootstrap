@@ -71,7 +71,12 @@ set -Eeuo pipefail
 DRY_RUN=0
 REINSTALL=0
 UNINSTALL=0
-TOKENS_FILE="/root/studio-tokens.txt"
+# Auto-detect tokens file. --tokens-file arg overrides.
+TOKENS_FILE=""
+for _tokf in /root/studio-tokens.txt /root/td-tokens.txt /root/sobol-tokens.txt; do
+  [[ -f "$_tokf" ]] && { TOKENS_FILE="$_tokf"; break; }
+done
+unset _tokf
 
 # Pinned version — override with env var to bump
 CLOUDFLARED_VERSION="${CLOUDFLARED_VERSION:-2025.5.0}"

@@ -1,0 +1,150 @@
+# stack-sobol-foundation — Foundation stack for all Sobol Data products
+#
+# Active continuation of TD-Proxmox. The original TD-Proxmox build was
+# shared publicly as a reference for the author's trading group and is
+# now frozen at github.com/artofax/td-proxmox tag v1.0.0-archive. This
+# stack is the private continuation: the same baseline (gitea +
+# mattermost + n8n + ollama-pi-agent + homepage + supporting layers)
+# but actively evolving as the foundation that all Sobol Data
+# commercial stacks (sobol-mirror, creator-studio, founder-ai-os)
+# inherit from via inherits.base_stack: sobol-foundation.
+#
+# See proxmox-stack-foundations/stack-manifest-spec.md for the spec this
+# follows, and proxmox-stack-foundations/conventions.md for the naming +
+# repo conventions this manifest is part of.
+
+# ===== identity ==============================================================
+
+name: sobol-foundation
+display_name: Sobol Foundation
+version: 1.0.0
+tier: foundation
+maintainer: sobol-data
+description: |
+  Reference self-hosted office stack on Proxmox VE: chat (Mattermost),
+  code repo (Gitea), workflow engine (n8n), dashboard (Homepage), and
+  local LLM agent (ollama-pi-agent) — wired together with an email
+  relay, USB backup target, vzdump nightly job, and an hourly health
+  watchdog that posts to Mattermost. The baseline foundation that all
+  Sobol Data commercial stacks (sobol-mirror, creator-studio,
+  founder-ai-os) inherit from.
+
+  Active continuation of TD-Proxmox (frozen public archive at
+  github.com/artofax/td-proxmox v1.0.0-archive). New addon work,
+  bootstrap improvements, and tier-defining features land here going
+  forward.
+
+# ===== app inventory =========================================================
+# Listed in install order. Dependencies must come before dependents.
+
+core_apps:
+  # ---- Phase 1: CTs created by ./automation/bootstrap-pve.sh ------------
+  - ollama-pi-agent             # CT 200, debian-12 base, Ollama + pi runtime
+  - gitea                       # CT 202, community-scripts ct/gitea.sh
+  - homepage                    # CT 110, community-scripts ct/homepage.sh
+
+  # ---- Phase 2: wired by ./automation/configure-apps.sh + addons --------
+  - mattermost                  # CT 101, addons/setup-mattermost.sh
+  - n8n                         # CT 102, addons/setup-n8n.sh
+
+  # ---- Phase 3: addon scripts applied to existing CTs -----------------
+  - filebrowser                 # on ollama-pi-agent (+ sandbox if installed)
+  - pi-mattermost-bridge        # on ollama-pi-agent — enables pi-bot in MM
+  - pi-web-uis                  # on ollama-pi-agent — cards/term/shell UIs
+
+optional_apps:
+  - sandbox                     # CT 215, community-scripts ct/docker.sh
+  - openwebui                   # CT 100, community-scripts ct/openwebui.sh
+
+excludes_apps: []
+
+# ===== workflow library ======================================================
+# Workflows that ship with this stack (active=false by import; operator
+# activates after binding credentials). See sobol-foundation/addons/n8n/workflows/README.md
+# for full catalog and per-workflow details.
+
+workflows:
+  - hello-mattermost                # smoke test webhook → MM
+  - gitea-events-to-mattermost      # Gitea push/PR/issue → MM #bot
+  - gitea-daily-digest              # 9am summary of yesterday's Gitea activity
+  - mm-ollama-chat                  # MM slash command → Ollama → reply
+  - postmark-events-to-mattermost   # Bounce/spam-complaint events → MM
+  - td-health-to-mattermost         # Watchdog state + daily heartbeat → MM
+
+# Workflows defined in this repo but reserved for downstream stacks
+# (sobol-mirror tier). Listed for completeness; setup-stack.sh will not
+# import them when installing sobol-foundation tier.
+deferred_workflows:
+  - slack-mirror-sync               # belongs to stack-sobol-mirror
+  - comms-agent-digest              # belongs to stack-sobol-mirror
+
+# ===== agent layer ===========================================================
+# Personas available for deployment via pi-personas/deploy-persona.sh.
+# Operator picks which to deploy; none auto-deploy.
+
+available_personas:
+  - trading-assistant             # CFO-style quant trading strategy review
+  - ops-engineer                  # watches td-health, files Gitea issues
+  - code-reviewer                 # reviews Gitea PRs, flags security/scope
+  - digest-comms                  # daily/weekly summaries of homelab activity
+
+default_personas: []              # operator picks during handoff
+
+# ===== stack-level features ==================================================
+# Not apps, but stack-wide concerns. Required features are installed by
+# setup-stack.sh; optional ones can be added later.
+
+features:
+  email_relay: required           # setup-pve-email.sh — Postmark SMTP relay
+  vzdump_backup: required         # setup-vzdump-schedule.sh — nightly CT backup
+  health_watchdog: required       # setup-health-watchdog.sh — hourly + heartbeat
+  gitea_email: required           # setup-gitea-email.sh — Gitea notification mail
+  config_backup: optional         # setup-pve-etc-backup.sh — /etc/pve tarball
+  usb_backup_target: optional     # setup-usb-backup.sh — USB as vzdump dest
+  port80_redirect: omitted        # per-CT iptables addon — manual install
+  smb_share: omitted              # setup-smb-share.sh — manual install
+  new_pi_agent: optional          # setup-new-pi-agent.sh — additional pi CTs
+
+# ===== dependencies ==========================================================
+
+inherits:
+  framework: proxmox-stack-foundations
+  framework_version: ">=1.0.0"
+  base_stack: null                # sobol-foundation IS the foundation — no parent
+  base_stack_version: null
+
+# ===== capacity planning =====================================================
+
+capacity:
+  ram_min_gb: 8                   # works with just core CTs, no optional
+  ram_recommended_gb: 16          # comfortable headroom
+  disk_min_gb: 100                # OS + CT data + ~14 days of backups
+  cpu_min_cores: 4                # 4 vCPUs across all CTs
+  network: "1 gigabit, DHCP — no static IP required"
+  notes: |
+    Tested baseline: T253 SSD 476GB / 16GB RAM / 4 cores.
+    8GB RAM works for core CTs only — adding openwebui + sandbox
+    pushes practical floor to 12GB. Mirror tier (which inherits from
+    this stack) adds postgres-mirror so recommend 16GB+ when used as
+    a sobol-mirror base.
+
+# ===== observability =========================================================
+
+observability:
+  watchdog_required: true
+  watchdog_alert_channels:
+    - mattermost                  # td-health-to-mattermost workflow
+    - email                       # ADMIN_NOTIFY_EMAIL via setup-pve-email
+  daily_heartbeat: true           # td-health-heartbeat.timer at 09:00 local
+
+# ===== commercial metadata ===================================================
+# sobol-foundation is the foundation reference, not a commercial product.
+# Commercial stacks derive from this via inherits.base_stack and add
+# their own commercial: block.
+
+commercial:
+  sku_name: null                  # not a SKU — reference stack only
+  base_price_usd: null
+  shipped_price_usd: null
+  monthly_support_tiers: null
+  vertical_landing_page: null

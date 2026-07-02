@@ -1,0 +1,161 @@
+# stack-creator-studio — The publishing-and-scheduling office-in-a-box
+#
+# Complete self-hosted creator's office: publish (Ghost), measure (Plausible),
+# schedule (Cal.com), and expose publicly (Cloudflared) — running on customer
+# hardware, under their control, without giving Substack/Medium/Calendly a
+# cut of revenue.
+#
+# Includes the full sobol-foundation operations layer underneath (chat, code repo,
+# workflow engine, dashboard, agent runtime) so the creator's office isn't
+# just a publishing pipeline — it's a working office where AI agents can
+# review drafts, schedule posts, and surface engagement patterns.
+#
+# This is the soboldata.com dogfood stack — the one we run our own business
+# on AND the first commercial SKU.
+#
+# Current version is 0.6.0 — Ghost is real, three vertical-app installers
+# remain stubs. See CHANGELOG.md for the gap between manifest intent and
+# current state.
+
+# ===== identity ==============================================================
+
+name: creator-studio
+display_name: Creator Studio
+version: 0.9.0                  # beta — RUNBOOK ported + wire.sh real; needs first customer install to hit v1.0.0
+tier: office-in-a-box
+maintainer: sobol-data
+description: |
+  Self-hosted office-in-a-box for solo creators and small studios
+  (1-10 people). Bundles Ghost (publishing), Plausible (privacy-first
+  analytics), Cal.com (scheduling), and Cloudflared (public access)
+  on top of the full sobol-foundation operations layer (Gitea, Mattermost,
+  n8n, Ollama, Homepage). The "I want my own creator stack without
+  giving SaaS providers a cut of revenue" SKU.
+
+# ===== app inventory =========================================================
+# Listed in install order. The base sobol-foundation apps are inherited via
+# inherits.base_stack and re-listed here for clarity (a stack manifest
+# is the source of truth for "what gets installed" — we don't make
+# operators chase the chain to discover what's in the box).
+
+core_apps:
+  # ---- Operations layer (inherited from sobol-foundation) -----------------------
+  - ollama-pi-agent             # CT 200, agent runtime (content-editor lives here)
+  - gitea                       # CT 202, version-control for themes + custom code
+  - homepage                    # CT 110, dashboard
+  - mattermost                  # CT 101, team chat + agent output surface
+  - n8n                         # CT 102, workflow engine
+  - filebrowser                 # on ollama-pi-agent (+ sandbox)
+  - pi-mattermost-bridge        # on ollama-pi-agent — operator @-mentions
+  - pi-web-uis                  # on ollama-pi-agent — cards/term/shell
+
+  # ---- Vertical apps (creator-studio additions) ---------------------------
+  - postgres-shared             # CT 303, shared DB for plausible + calcom
+  - ghost                       # CT 300, publishing CMS
+  - plausible                   # CT 301, analytics (Plausible CE via docker-compose)
+  - calcom                      # CT 302, scheduling (Cal.com self-host via docker-compose)
+  - cloudflared                 # CT 304, public tunnel (systemd-managed cloudflared connector, CF Zero Trust dashboard-first)
+
+optional_apps:
+  - sandbox                     # CT 215, docker for tinkering / per-customer apps
+  - openwebui                   # CT 100, browser LLM chat for team use
+
+excludes_apps: []               # office-in-a-box is the most-included tier
+
+# ===== workflow library ======================================================
+
+workflows:
+  # Inherited from sobol-foundation base
+  - hello-mattermost
+  - gitea-events-to-mattermost
+  - gitea-daily-digest
+  - mm-ollama-chat
+  - postmark-events-to-mattermost
+  - td-health-to-mattermost
+
+  # Vertical workflows (from the sobol-foundation library — see the
+  # library catalog at ../../sobol-foundation/addons/n8n/workflows/README.md)
+  - ghost-publish-to-mattermost              # v0.6.0 — Ghost webhook → MM #bot
+  - plausible-weekly-digest-to-mattermost    # v0.6.2 — Monday 9am digest → MM #bot
+  - calcom-booking-to-mattermost             # v0.6.3 — Cal.com booking events → MM #bot
+  - cloudflared-tunnel-health-to-mattermost  # v0.7.0 — tunnel health check → MM #bot
+
+  # Planned — pending stack wire.sh + addon depth:
+  # - calcom-no-show-followup          # planned v1.1 (needs wire.sh event-type setup first)
+
+deferred_workflows:
+  - slack-mirror-sync             # sobol-mirror tier only
+  - comms-agent-digest            # sobol-mirror tier only
+
+# ===== agent layer ===========================================================
+
+available_personas:
+  - ops-engineer                # homelab health
+  - digest-comms                # daily team digest
+  - code-reviewer               # reviews Gitea PRs (themes + custom code)
+  # content-editor               # planned v1.0 — reviews Ghost drafts pre-publish
+  # social-scheduler             # planned v1.0 — orchestrates Cal.com + Ghost timing
+
+default_personas: []             # operator picks at install/handoff
+
+# ===== stack-level features ==================================================
+
+features:
+  email_relay: required           # Ghost + Plausible + Cal.com all send mail
+  vzdump_backup: required         # creator's content IS the product — protect it
+  health_watchdog: required       # 10+ CTs needs active monitoring
+  gitea_email: required           # Gitea notification mail for theme PRs
+  cloudflared_tunnel: required    # NEW feature key — public access to apps
+  config_backup: optional         # /etc/pve nightly tarball
+  usb_backup_target: optional     # encourage; not strictly required
+  port80_redirect: omitted        # Cloudflared makes this unnecessary
+  smb_share: omitted              # not relevant to creator-studio use case
+  new_pi_agent: optional          # add more pi agents post-install if needed
+
+# ===== dependencies ==========================================================
+
+inherits:
+  framework: proxmox-stack-foundations
+  framework_version: ">=1.0.0"
+  base_stack: sobol-foundation
+  base_stack_version: ">=1.0.0"
+
+# ===== capacity planning =====================================================
+
+capacity:
+  ram_min_gb: 16                  # 10+ CTs running concurrently needs real RAM
+  ram_recommended_gb: 32          # comfortable headroom for Ghost media growth
+  disk_min_gb: 250                # Ghost media + Plausible CH + Cal.com bookings
+  cpu_min_cores: 4
+  network: "1 gigabit DHCP; customer's domain pointed at Cloudflare for the tunnel"
+  notes: |
+    The vertical apps are resource-hungry compared to the operations layer.
+    Ghost: 1GB baseline; media uploads eat disk fast (assume 5GB/year per
+    moderate publishing).
+    Plausible: ClickHouse can hit 4GB+ under load.
+    Cal.com: heaviest (Next.js + Node + Postgres); 2GB minimum, comfortable
+    at 3GB.
+    Recommend the 32GB Mini PC tier for any deployment expected to handle
+    >5K monthly visitors OR >100 bookings/month.
+
+# ===== observability =========================================================
+
+observability:
+  watchdog_required: true
+  watchdog_alert_channels:
+    - mattermost
+    - email
+  daily_heartbeat: true
+
+# ===== commercial metadata ===================================================
+# See sobol-business/OFFERINGS.md §1B for full SKU definitions.
+
+commercial:
+  sku_name: "Creator Studio"
+  base_price_usd: 2500            # Studio Stack BYO (customer brings hardware)
+  shipped_price_usd: 3500         # Studio Stack Shipped (we ship pre-imaged Mini PC)
+  monthly_support_tiers:
+    standard: 500                 # NBD SLA, 1 new persona/quarter
+    pro: 1000                     # 4-hour SLA, 2 personas/quarter
+    premium: 2000                 # 1-hour SLA, 4 personas/quarter, roadmap input
+  vertical_landing_page: https://soboldata.com/creator-studio

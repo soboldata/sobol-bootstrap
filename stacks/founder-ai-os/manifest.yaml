@@ -1,0 +1,192 @@
+# stack-founder-ai-os — Premium tier: an AI workforce for ambitious solo founders
+#
+# Inspired by Dan Martel's "Buy Back Your Time" framework — instead of a
+# single AI assistant, the founder gets a TEAM of role-specific agents,
+# each on its own pi-agent CT with its own bounded authority and its own
+# voice. The factory pattern (from setup-new-pi-agent.sh) makes adding
+# the 6th, 7th, Nth persona a one-command operation as the founder grows.
+#
+# This is the heaviest, most capability-rich Sobol Data tier. Operations
+# layer inherited from sobol-foundation; the Founder AI OS layer ADDS:
+#   - 5 default-deployed personas (one per pi-agent CT)
+#   - Chief Python services (the orchestration backend that wires
+#     personas together via shared state + cross-agent handoffs)
+#   - Premium support (1-hour SLA, monthly roadmap review)
+#
+# Currently v0.7.0 — scaffolding + persona definitions exist; the
+# end-to-end install on a single PVE host hasn't been validated against
+# a paying customer. See CHANGELOG for the gap to v1.0.0.
+
+# ===== identity ==============================================================
+
+name: founder-ai-os
+display_name: Founder AI OS
+version: 0.7.0                    # beta — needs first customer end-to-end test
+tier: premium
+maintainer: sobol-data
+description: |
+  An AI workforce for ambitious solo founders. Inspired by Dan Martel's
+  "Buy Back Your Time" framework — instead of a single AI assistant,
+  the founder hires a team of role-specific agents (gatekeeper, ops
+  director, customer voice, content engine, growth analyst, etc.),
+  each on its own pi-agent CT with bounded authority and its own voice.
+  The factory pattern makes adding new roles a one-command operation
+  as the founder's needs grow. Premium tier — heaviest capacity, most
+  agents, fastest support SLA.
+
+# ===== app inventory =========================================================
+
+core_apps:
+  # ---- Operations layer (inherited from sobol-foundation) -----------------------
+  - ollama-pi-agent             # CT 200, the FIRST agent CT (gatekeeper lives here)
+  - gitea                       # CT 202, version-control for persona definitions
+  - homepage                    # CT 110, dashboard
+  - mattermost                  # CT 101, the team's primary collaboration surface
+  - n8n                         # CT 102, orchestration + cross-agent triggers
+  - filebrowser                 # shared file ops
+  - pi-mattermost-bridge        # each persona speaks in MM
+  - pi-web-uis                  # persona-card UIs for visual presence
+
+  # ---- Founder AI OS additions -------------------------------------------
+  # Additional pi-agent CTs (one per persona) — spun up by setup-new-pi-agent.sh
+  # invoked by the factory script. CTIDs in the 400-series per the
+  # CTID convention from session task #44.
+  - pi-agent-gatekeeper         # CT 400, inbound triage
+  - pi-agent-ops-director       # CT 401, internal coordination + status
+  - pi-agent-customer-voice     # CT 402, customer-facing comms + sentiment
+  - pi-agent-content-engine     # CT 403, content production + scheduling
+  - pi-agent-growth-analyst     # CT 404, metrics review + experiment design
+
+  # The "Chief Python" — backend services that wire personas together.
+  # Shared state, cross-agent handoffs, scheduled batches.
+  - chief-python-services       # CT 410, FastAPI orchestration backend
+
+optional_apps:
+  - sandbox                     # docker for ad-hoc experiments / one-off services
+  - openwebui                   # browser LLM chat for founder direct-to-model access
+
+# Excludes nothing — premium tier is the most-included tier
+excludes_apps: []
+
+# ===== workflow library ======================================================
+
+workflows:
+  # Inherited from sobol-foundation base
+  - hello-mattermost
+  - gitea-events-to-mattermost
+  - gitea-daily-digest
+  - mm-ollama-chat
+  - postmark-events-to-mattermost
+  - td-health-to-mattermost
+
+  # Founder AI OS additions (the orchestration backbone — TBD as Chief
+  # Python services formalize; commented until JSONs ship):
+  # - persona-handoff-coordinator      # cross-agent task handoff via MM threads
+  # - daily-orchestrator-standup       # 9am summary from all personas, posted to founder
+  # - weekly-founder-state-of-the-os   # Friday report: what each persona did this week
+  # - persona-conflict-resolver        # when two personas disagree, route to founder
+
+deferred_workflows:
+  - slack-mirror-sync           # sobol-mirror tier only
+  - comms-agent-digest          # sobol-mirror tier only
+
+# ===== agent layer ===========================================================
+# Founder AI OS is the FIRST stack where personas are the headline product.
+# Five personas auto-deploy on install — that's what the customer pays for.
+# The factory pattern lets the operator add a 6th-Nth persona later as the
+# founder's needs grow.
+
+available_personas:
+  - gatekeeper                  # bounded inbound triage
+  - ops-director                # internal coordination
+  - customer-voice              # customer comms + voice-of-customer synthesis
+  - content-engine              # content production + cross-platform scheduling
+  - growth-analyst              # metrics review + experiment design
+  - ops-engineer                # infra health (from sobol-foundation base)
+  - code-reviewer               # if founder pushes code (from sobol-foundation base)
+  - digest-comms                # from sobol-foundation base
+  - trading-assistant           # if founder also trades (from sobol-foundation base)
+
+# All 5 Founder AI OS personas auto-deploy on install. The product IS
+# the team showing up ready to work on day one.
+default_personas:
+  - gatekeeper
+  - ops-director
+  - customer-voice
+  - content-engine
+  - growth-analyst
+
+# ===== stack-level features ==================================================
+
+features:
+  email_relay: required
+  vzdump_backup: required
+  health_watchdog: required
+  gitea_email: required
+  config_backup: required       # premium tier — protect agent state config aggressively
+  usb_backup_target: required   # required at premium (vs optional elsewhere)
+  new_pi_agent: required        # the factory pattern is core to the value prop
+  persona_orchestration: required  # NEW feature key — Chief Python services
+  smb_share: optional
+  port80_redirect: omitted      # Cloudflared if exposing publicly (separate config)
+
+# ===== dependencies ==========================================================
+
+inherits:
+  framework: proxmox-stack-foundations
+  framework_version: ">=1.0.0"
+  base_stack: sobol-foundation
+  base_stack_version: ">=1.0.0"
+
+# ===== capacity planning =====================================================
+# Heaviest of all the tiers — 5+ pi-agent CTs each running their own Ollama
+# session add up fast.
+
+capacity:
+  ram_min_gb: 32                # absolute floor — 5 pi-agents × ~3GB each + ops layer
+  ram_recommended_gb: 64        # comfortable for full default persona set + headroom
+  disk_min_gb: 500              # OS + 12 CTs + agent state + backups
+  cpu_min_cores: 8              # 5 concurrent LLM inferences benefit from cores
+  network: "1 gigabit DHCP; Cloudflared optional if customer wants public personas"
+  notes: |
+    Premium tier needs premium hardware. 32GB RAM is the absolute floor
+    and gets tight under sustained inference load — 64GB is the
+    recommended platform. The Beelink/Minisforum class Mini PCs cap at
+    64GB which is the practical ceiling for this tier.
+
+    For founders running 6+ personas (above the default 5), recommend a
+    full-size desktop or rackmount with 128GB+ RAM rather than upgrading
+    the Mini PC.
+
+    Each pi-agent CT runs its own Ollama instance. For shared model
+    economy across agents, consider the openwebui CT as a shared
+    inference endpoint and configure personas to call it instead of
+    running per-agent Ollama (post-v1.0 optimization).
+
+# ===== observability =========================================================
+
+observability:
+  watchdog_required: true
+  watchdog_alert_channels:
+    - mattermost
+    - email
+  daily_heartbeat: true
+  # Premium tier specifics (TBD):
+  # - per-persona heartbeat (each persona posts a daily "still alive" line)
+  # - aggregated weekly "state of the OS" report from chief-python-services
+
+# ===== commercial metadata ===================================================
+# See sobol-business/OFFERINGS.md §1B for tier definitions. Founder AI OS
+# is positioned at the top of the office-in-a-box price ladder, plus
+# premium managed support is required (not optional).
+
+commercial:
+  sku_name: "Founder AI OS"
+  base_price_usd: 5000          # BYO hardware
+  shipped_price_usd: 7000       # + 64GB Mini PC or equivalent
+  monthly_support_tiers:
+    # Standard tier NOT offered for Founder AI OS — too much complexity
+    # to support on NBD. Pro is the minimum.
+    pro: 2000                   # 4-hour SLA, 2 new personas/quarter, quarterly review
+    premium: 4000               # 1-hour SLA, 4 personas/quarter, monthly roadmap
+  vertical_landing_page: https://soboldata.com/founder-ai-os

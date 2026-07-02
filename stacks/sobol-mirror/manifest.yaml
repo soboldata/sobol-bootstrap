@@ -1,0 +1,165 @@
+# stack-sobol-mirror — The wedge product: read-only sync + AI agents
+#
+# Small businesses pay 8-20% of revenue to SaaS. They can't switch overnight
+# — the data is there, the team is trained, the integrations work. Asking
+# them to "rip out QuickBooks/Slack/HubSpot and self-host" is a 6-month
+# sales cycle even when they want to.
+#
+# Sobol Mirror inverts: "keep everything you have. We sit alongside, read
+# your data into a local mirror, and run AI agents on top. After 30 days
+# you decide what to keep, what to migrate, what to cancel."
+#
+# This stack is the wedge — minimum apps, maximum agent value. It's
+# deliberately lighter than the office-in-a-box tier because lightness IS
+# the sales pitch. See sobol-business/gtm/read-only-sync.md for the full
+# GTM thesis and sobol-business/architecture/sync-layer.md for the
+# technical architecture this stack manifest implements.
+
+# ===== identity ==============================================================
+
+name: sobol-mirror
+display_name: Sobol Mirror
+version: 1.0.0
+tier: mirror
+maintainer: sobol-data
+description: |
+  Self-hosted "sit alongside" stack that mirrors customer SaaS read-only
+  (Slack, QuickBooks, HubSpot, Notion, Gmail) into a local Postgres
+  and runs AI agents on top — daily digests, anomaly flags, action-item
+  surfacing — without requiring customers to migrate off anything.
+  The Trojan-horse entry product: cancel anytime, expand later, or
+  migrate fully when ready.
+
+# ===== app inventory =========================================================
+# Deliberately smaller than the foundation. The wedge is "we don't need to
+# install much." Customer's existing SaaS stays in place; this stack reads
+# from it and posts insights, that's it.
+#
+# Inherits base addon library from sobol-foundation (see inherits.base_stack
+# below) — we don't copy scripts, we reference them. Manifest declares
+# what gets INSTALLED at this tier.
+
+core_apps:
+  # ---- From base sobol-foundation: kept ------------------------------------------
+  - ollama-pi-agent             # CT 200, runs comms-agent + future personas
+  - mattermost                  # CT 101, agent output surface
+  - n8n                         # CT 102, sync workflow + digest workflow
+  - homepage                    # CT 110, dashboard
+
+  # ---- Sobol Mirror-specific additions ------------------------------------
+  - postgres-mirror             # NEW CT 310, sobol_mirror DB for sync data
+  - connector-slack             # schema + n8n workflow + agent_view layer
+  # connector-quickbooks         # planned v1.1 — see roadmap
+  # connector-google             # planned v1.1 — see roadmap
+  # connector-notion             # planned v1.1 — see roadmap
+  # connector-hubspot            # planned v1.1 — see roadmap
+
+# Apps the customer CAN add later (post-trial conversion → upgrade tier)
+optional_apps:
+  - gitea                       # add when customer wants their own version-control
+  - openwebui                   # add for ad-hoc team LLM chat
+
+# Apps EXPLICITLY excluded from the base sobol-foundation install at this tier.
+# Documents intent — sobol-business/gtm/read-only-sync.md positioning
+# depends on this being lighter than the office stack.
+excludes_apps:
+  - gitea                       # the wedge: no need for own version-control
+  - pi-mattermost-bridge        # no operator chat session — agent posts only
+  - pi-web-uis                  # no operator pi shell — managed support handles it
+  - filebrowser                 # no file ops at the wedge tier
+  - sandbox                     # no docker host needed
+  - openwebui                   # ad-hoc chat not part of the value prop
+
+# ===== workflow library ======================================================
+# Active workflows the wedge product delivers. The slack-mirror-sync +
+# comms-agent-digest pair is the entire MVP demo.
+
+workflows:
+  - slack-mirror-sync           # hourly Slack API → postgres mirror
+  - comms-agent-digest          # 9am cron → digest from agent_view → MM #bot
+  - td-health-to-mattermost     # watchdog state → MM (inherited from base)
+
+# Workflows defined in the framework but not installed at this tier:
+deferred_workflows:
+  - gitea-events-to-mattermost  # no Gitea at this tier
+  - gitea-daily-digest          # no Gitea at this tier
+  - mm-ollama-chat              # interactive chat not wedge value prop
+  - hello-mattermost            # smoke-test only, not for customer-facing install
+  - postmark-events-to-mattermost  # email deliverability not in wedge scope
+
+# ===== agent layer ===========================================================
+# Personas relevant to mirror customers. comms-agent is the lead — it
+# delivers the daily Slack digest that is the wedge's main visible value.
+
+available_personas:
+  - comms-agent                 # daily Slack digest + on-demand thread queries
+  # cfo-agent                    # planned v1.1 — reads QuickBooks mirror
+  # sales-agent                  # planned v1.1 — reads HubSpot mirror
+  # inbox-triage                 # planned v1.1 — reads Gmail mirror
+  - ops-engineer                # for managed-support customers (paid tier)
+
+default_personas:
+  - comms-agent                 # auto-deployed — IS the product
+
+# ===== stack-level features ==================================================
+
+features:
+  email_relay: required         # customer-facing comms still need to work
+  vzdump_backup: required       # protect customer's mirrored data
+  health_watchdog: required     # managed support depends on this
+  config_backup: optional       # nice-to-have on a wedge tier
+  gitea_email: omitted          # no Gitea
+  usb_backup_target: optional   # encourage but don't require
+  smb_share: omitted
+  port80_redirect: omitted
+  new_pi_agent: omitted         # don't expand horizontally at this tier
+
+# ===== dependencies ==========================================================
+
+inherits:
+  framework: proxmox-stack-foundations
+  framework_version: ">=1.0.0"
+  base_stack: sobol-foundation        # builds on the foundation
+  base_stack_version: ">=1.0.0"
+
+# ===== capacity planning =====================================================
+# Lighter than full sobol-foundation because we install fewer apps. The
+# postgres-mirror CT adds ~2GB working set, but the absent CTs (sandbox,
+# openwebui, bridge, web-uis) free up more than that.
+
+capacity:
+  ram_min_gb: 8                 # works for solo / small team
+  ram_recommended_gb: 16        # comfortable for team tier with full connector set
+  disk_min_gb: 100              # OS + CTs + ~5GB/year of Slack mirror per workspace
+  cpu_min_cores: 4
+  network: "1 gigabit, DHCP — no static IP required"
+  notes: |
+    The 'Shipped' SKU includes a Mini PC (Beelink EQR5 / Minisforum UM690
+    class) at ~16GB RAM / 500GB NVMe / 4-core, which lands comfortably
+    in the 'recommended' band. BYO customers should match or exceed
+    this profile.
+
+# ===== observability =========================================================
+
+observability:
+  watchdog_required: true
+  watchdog_alert_channels:
+    - mattermost                # td-health-to-mattermost
+    - email                     # ADMIN_NOTIFY_EMAIL
+  daily_heartbeat: true         # 09:00 local — confirms managed-support pulse
+
+# ===== commercial metadata ===================================================
+# The wedge SKU lineup. See sobol-business/OFFERINGS.md §1A and
+# sobol-business/gtm/read-only-sync.md for the pricing rationale + sales motion.
+
+commercial:
+  sku_name: "Sobol Mirror"
+  # Trial conversion path: $49 trial → $99/mo Solo → $249/mo Team → $499/mo Pro
+  base_price_usd: 99            # Solo tier monthly (BYO hardware)
+  shipped_price_usd: 199        # Solo tier monthly + hardware amortized
+  monthly_support_tiers:
+    trial: 49                   # 30-day one-time
+    solo: 99                    # 3 connectors, 2 agents
+    team: 249                   # 6 connectors, 4 agents
+    pro: 499                    # unlimited connectors + agents, priority support
+  vertical_landing_page: https://soboldata.com/mirror

@@ -1,0 +1,16 @@
+.DS_Store
+*.swp
+*.tmp
+.env
+.env.local
+
+# Customer-specific overlay files (each customer has its own customer-<id> repo)
+customers/*
+!customers/.gitkeep
+
+# Drafts and scratch
+DRAFT-*.md
+SCRATCH-*.md
+
+# Persona-specific SYSTEM.md drafts that aren't shipped (private/sensitive)
+personas-draft/

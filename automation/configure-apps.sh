@@ -375,79 +375,179 @@ _gitea_config_path() {
 #   1. No app.ini on disk yet, OR
 #   2. /install endpoint reachable + returns the install page (200 with form)
 # Either means we need to POST /install before any CLI work.
+#
+# Path list widened 2026-07-02 after user hit the install wizard on a
+# fresh community-scripts install where app.ini lived at neither the
+# original /etc/gitea nor /var/lib/gitea/custom/conf paths we checked.
+# /home/git/gitea and /var/lib/gitea are the two variants shipped by
+# community-scripts' current gitea.sh; we now check both.
 gitea_install_lock_on() {
   local ctid="$1"
   pct exec "$ctid" -- bash -lc '
-    for p in /etc/gitea/app.ini /var/lib/gitea/custom/conf/app.ini /opt/gitea/custom/conf/app.ini; do
+    for p in /etc/gitea/app.ini \
+             /var/lib/gitea/custom/conf/app.ini \
+             /opt/gitea/custom/conf/app.ini \
+             /home/git/gitea/custom/conf/app.ini \
+             /var/lib/gitea/conf/app.ini; do
       [[ -f "$p" ]] && grep -qE "^INSTALL_LOCK\s*=\s*true" "$p" && exit 0
     done
     exit 1
   ' >/dev/null 2>&1
 }
 
+# Diagnostic — where does app.ini actually live, and what does its
+# INSTALL_LOCK say? Returns "path=<path> lock=<true|false|missing>".
+# For use in error messages so the operator sees the real state.
+_gitea_install_lock_where() {
+  local ctid="$1"
+  pct exec "$ctid" -- bash -lc '
+    for p in /etc/gitea/app.ini \
+             /var/lib/gitea/custom/conf/app.ini \
+             /opt/gitea/custom/conf/app.ini \
+             /home/git/gitea/custom/conf/app.ini \
+             /var/lib/gitea/conf/app.ini; do
+      if [[ -f "$p" ]]; then
+        lock=$(grep -E "^INSTALL_LOCK\s*=" "$p" | head -1 | tr -d "[:space:]" | cut -d= -f2)
+        [[ -z "$lock" ]] && lock="missing"
+        echo "path=$p lock=$lock"
+        exit 0
+      fi
+    done
+    echo "path=<no-app.ini-found> lock=none"
+  ' 2>/dev/null
+}
+
 # Run the first-run install by POSTing the form. Sets up SQLite3 and the
 # defaults the community helper omitted. After this, app.ini is on disk and
 # INSTALL_LOCK = true, so subsequent CLI commands work.
+#
+# Rewritten 2026-07-02 to be diagnostic-heavy after a real-hardware install
+# where configure-apps.sh reported success but the operator opened a
+# browser to Gitea and saw the SQLite3 install wizard. Prior version
+# fired the POST with -fsS -o /dev/null — so any silent failure (validation
+# error, redirect to install page, empty response) went undetected. New
+# version captures response status + body, verifies actual side effects
+# (app.ini + INSTALL_LOCK=true) with a longer timeout, and dies loudly
+# with the exact failure state when the POST doesn't take.
 gitea_first_run_setup() {
   local ctid="$1"
   local ip="$2"
 
+  log "  Gitea CTID=$ctid IP=$ip"
+  log "  Current install-lock state: $(_gitea_install_lock_where "$ctid")"
+
   if (( ! DRY_RUN )) && gitea_install_lock_on "$ctid"; then
-    log "  Gitea install lock already set — first-run setup skipped."
+    log "  ✓ Gitea install lock already set — skipping first-run setup."
     return
   fi
 
   if (( DRY_RUN )); then
     log "  [dry-run] Would POST /install (SQLite3, default paths) and wait for app.ini."
     log "  [dry-run] Skipping the real verification loop so dry-run can finish."
-  else
-    log "  First-run wizard detected. POSTing /install (SQLite3, default paths)..."
+    return
   fi
 
-  # The form expects URL-encoded fields. We feed them through curl --data-urlencode
-  # so the server sees the same shape as the browser would. The fields below
-  # match what's visible in the install page screenshot — anything we leave out
-  # uses the server's default.
-  run "pct exec $ctid -- curl -fsS -X POST 'http://127.0.0.1:3000/' \
-       --data-urlencode 'db_type=sqlite3' \
-       --data-urlencode 'db_host=' \
-       --data-urlencode 'db_user=' \
-       --data-urlencode 'db_passwd=' \
-       --data-urlencode 'db_name=gitea' \
-       --data-urlencode 'ssl_mode=disable' \
-       --data-urlencode 'db_schema=' \
-       --data-urlencode 'charset=utf8' \
-       --data-urlencode 'db_path=/var/lib/gitea/data/gitea.db' \
-       --data-urlencode 'app_name=Gitea' \
-       --data-urlencode 'repo_root_path=/var/lib/gitea/data/gitea-repositories' \
-       --data-urlencode 'lfs_root_path=/var/lib/gitea/data/lfs' \
-       --data-urlencode 'run_user=gitea' \
-       --data-urlencode 'domain=${ip}' \
-       --data-urlencode 'ssh_port=22' \
-       --data-urlencode 'http_port=3000' \
-       --data-urlencode 'app_url=http://${ip}:3000/' \
-       --data-urlencode 'log_root_path=/var/lib/gitea/log' \
-       --data-urlencode 'smtp_addr=' --data-urlencode 'smtp_port=' \
-       --data-urlencode 'smtp_from=' --data-urlencode 'smtp_user=' \
-       --data-urlencode 'smtp_passwd=' \
-       --data-urlencode 'offline_mode=on' \
-       --data-urlencode 'default_allow_create_organization=on' \
-       --data-urlencode 'default_enable_timetracking=on' \
-       --data-urlencode 'no_reply_address=noreply.localhost' \
-       --data-urlencode 'password_algorithm=pbkdf2' \
-       -o /dev/null"
+  # Sanity check: is Gitea's HTTP server even responding? If not, the POST
+  # will fail with connection refused and we should surface that clearly
+  # rather than 20 seconds of confusing timeout later.
+  local ping_status
+  ping_status=$(pct exec "$ctid" -- bash -lc "curl -sS -o /dev/null -w '%{http_code}' --max-time 5 http://127.0.0.1:3000/" 2>/dev/null || echo 000)
+  log "  Gitea HTTP root probe: HTTP $ping_status"
+  if [[ ! "$ping_status" =~ ^(200|302|303)$ ]]; then
+    die "  Gitea isn't responding on 127.0.0.1:3000 (HTTP $ping_status). Debug:
+    pct exec $ctid -- systemctl status gitea --no-pager
+    pct exec $ctid -- journalctl -u gitea --no-pager -n 30"
+  fi
 
-  # Dry-run never actually POSTs, so don't wait for state that won't change.
-  if (( DRY_RUN )); then return; fi
+  log "  First-run wizard detected. POSTing /install (SQLite3, default paths)..."
+  log "    domain=$ip"
+  log "    app_url=http://$ip:3000/"
 
-  # Wait for app.ini to appear (Gitea writes it during the install POST, then
-  # restarts itself; can take a few seconds).
+  # Capture status + first line of response body. Gitea's install form
+  # returns:
+  #   - 302 Location: /user/login  → success (INSTALL_LOCK gets written)
+  #   - 200 with the install page HTML → validation error (form re-rendered)
+  #   - 500 → server error (usually db path perms)
+  # -o writes body to a file so we can grep the first line; -w prints
+  # the status. Old version used -fsS which SILENCED any non-2xx and
+  # left us in the dark.
+  local post_status
+  post_status=$(pct exec "$ctid" -- bash -lc "
+    curl -sS -o /tmp/gitea-install-resp.html -w '%{http_code}' \
+      -X POST 'http://127.0.0.1:3000/' \
+      --data-urlencode 'db_type=sqlite3' \
+      --data-urlencode 'db_host=' \
+      --data-urlencode 'db_user=' \
+      --data-urlencode 'db_passwd=' \
+      --data-urlencode 'db_name=gitea' \
+      --data-urlencode 'ssl_mode=disable' \
+      --data-urlencode 'db_schema=' \
+      --data-urlencode 'charset=utf8' \
+      --data-urlencode 'db_path=/var/lib/gitea/data/gitea.db' \
+      --data-urlencode 'app_name=Gitea' \
+      --data-urlencode 'repo_root_path=/var/lib/gitea/data/gitea-repositories' \
+      --data-urlencode 'lfs_root_path=/var/lib/gitea/data/lfs' \
+      --data-urlencode 'run_user=gitea' \
+      --data-urlencode 'domain=$ip' \
+      --data-urlencode 'ssh_port=22' \
+      --data-urlencode 'http_port=3000' \
+      --data-urlencode 'app_url=http://$ip:3000/' \
+      --data-urlencode 'log_root_path=/var/lib/gitea/log' \
+      --data-urlencode 'smtp_addr=' --data-urlencode 'smtp_port=' \
+      --data-urlencode 'smtp_from=' --data-urlencode 'smtp_user=' \
+      --data-urlencode 'smtp_passwd=' \
+      --data-urlencode 'offline_mode=on' \
+      --data-urlencode 'default_allow_create_organization=on' \
+      --data-urlencode 'default_enable_timetracking=on' \
+      --data-urlencode 'no_reply_address=noreply.localhost' \
+      --data-urlencode 'password_algorithm=pbkdf2'
+  " 2>/dev/null || echo 000)
+
+  log "  POST /install returned HTTP $post_status"
+
+  # Show the body head — helps identify HTML flash errors that Gitea
+  # embeds in the re-rendered install page.
+  local body_head
+  body_head=$(pct exec "$ctid" -- bash -lc "grep -oE '(class=\"ui negative message\"[^>]*>[^<]*|<title>[^<]*|flashError.[^&]{0,120})' /tmp/gitea-install-resp.html 2>/dev/null | head -3" 2>/dev/null || true)
+  if [[ -n "$body_head" ]]; then
+    log "  Response body signals:"
+    printf '    %s\n' "$body_head" | head -5 | sed 's/^/    /'
+  fi
+
+  case "$post_status" in
+    302|303)
+      log "  ✓ POST accepted (redirected). Waiting for INSTALL_LOCK to appear..."
+      ;;
+    200)
+      # Gitea re-rendered the install page. Something failed validation.
+      warn "  POST returned 200 (Gitea re-rendered install page). Common causes:"
+      warn "    - db_path permission denied (SQLite can't write /var/lib/gitea/data/gitea.db)"
+      warn "    - domain / app_url validation failure"
+      warn "    - Gitea version schema drift (form field added or renamed)"
+      warn "  Response body head from /tmp/gitea-install-resp.html above."
+      die "  Gitea /install POST didn't finalize (200 = validation error). See above."
+      ;;
+    *)
+      die "  Gitea /install POST failed with HTTP $post_status. Debug:
+    pct exec $ctid -- cat /tmp/gitea-install-resp.html | head -30
+    pct exec $ctid -- journalctl -u gitea --no-pager -n 30"
+      ;;
+  esac
+
+  # Wait for app.ini to appear + INSTALL_LOCK=true. Gitea writes app.ini
+  # during install processing then restarts itself. Timeout bumped to 60s
+  # (was 40s) because slow disks / cold community-scripts images take
+  # longer than fast dev boxes.
   local i=0
   while ! gitea_install_lock_on "$ctid"; do
-    (( ++i > 20 )) && die "  Gitea didn't finalize install after 40s. Check pct exec $ctid -- journalctl -u gitea --no-pager | tail -20"
+    (( ++i > 30 )) && die "  Gitea INSTALL_LOCK never became true after 60s.
+    Current state: $(_gitea_install_lock_where "$ctid")
+    POST returned $post_status
+    Debug: pct exec $ctid -- journalctl -u gitea --no-pager -n 50
+           pct exec $ctid -- ls -la /var/lib/gitea/data/ /etc/gitea/ 2>/dev/null"
     sleep 2
   done
-  log "  Install complete. app.ini written, INSTALL_LOCK = true."
+  log "  ✓ INSTALL_LOCK=true confirmed at: $(_gitea_install_lock_where "$ctid")"
 
   # Wait again for the daemon to come back on port 3000 after the post-install restart.
   wait_for_port_inside_ct "$ctid" 3000 "Gitea (post-install restart)"

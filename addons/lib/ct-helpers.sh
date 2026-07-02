@@ -92,16 +92,60 @@ ct_wait_dns_ready() {
   return 1
 }
 
-# ct_fix_dns <CTID>
-# Recovery: try to bring DNS back up. Common on Ubuntu 24 CTs where
-# systemd-resolved is racing at boot. We restart it and give it a
-# few seconds to settle. Idempotent — safe to call even if DNS is
-# already fine.
+# ct_stage_public_dns <CTID>
+# Force /etc/resolv.conf inside the CT to use public DNS (1.1.1.1 +
+# 8.8.8.8) so pre-Tailscale bootstrap work (apt-get update, curl) can
+# resolve hostnames. Idempotent.
 #
-# If systemd-resolved isn't the resolver (e.g. Debian without it),
-# we skip cleanly.
+# Once Tailscale is installed and `tailscale up --accept-dns` runs
+# inside the CT, Tailscale takes over /etc/resolv.conf and this staged
+# config is replaced with Tailscale MagicDNS. So this is a scaffold,
+# not the final state.
+ct_stage_public_dns() {
+  local ctid="$1"
+  log "  Staging public DNS (1.1.1.1) in CT $ctid for pre-Tailscale bootstrap..."
+  pct exec "$ctid" -- bash -c "cat > /etc/resolv.conf <<'RESOLV_EOF'
+# Temporary — staged by ct-helpers.sh (ct_stage_public_dns).
+# Tailscale will overwrite this after 'tailscale up --accept-dns' runs
+# and the CT joins the tailnet.
+nameserver 1.1.1.1
+nameserver 8.8.8.8
+RESOLV_EOF"
+}
+
+# ct_fix_dns <CTID>
+# Recovery: try to bring DNS back up. Two known failure modes:
+#
+#   A. CT's resolv.conf points at Tailscale MagicDNS (100.100.100.100)
+#      but CT isn't on the tailnet yet. Happens when the PVE host was
+#      joined to the tailnet BEFORE the CT was created — pct create
+#      copies the host's resolv.conf, which now points at MagicDNS.
+#      The CT can't reach 100.100.100.100 until it's on tailnet too.
+#      → Fix: stage public DNS. Tailscale will reclaim resolv.conf
+#              once 'tailscale up --accept-dns' runs inside the CT.
+#
+#   B. systemd-resolved is racing at boot (common on Ubuntu 24 CTs
+#      after config edits + reboot). resolv.conf is a stub that will
+#      populate once resolved is fully up.
+#      → Fix: restart systemd-resolved.
+#
+# Idempotent — safe to call even if DNS is already fine.
 ct_fix_dns() {
   local ctid="$1"
+  local resolv
+  resolv="$(pct exec "$ctid" -- cat /etc/resolv.conf 2>/dev/null || true)"
+
+  # Case A: pointing at Tailscale MagicDNS from an unjoined CT
+  if echo "$resolv" | grep -q '100\.100\.100\.100'; then
+    warn "  CT $ctid resolv.conf points at Tailscale MagicDNS (100.100.100.100),"
+    warn "  but the CT hasn't joined the tailnet yet. Staging public DNS so"
+    warn "  bootstrap can proceed; Tailscale will take resolv.conf back after"
+    warn "  'tailscale up --accept-dns' runs."
+    ct_stage_public_dns "$ctid"
+    return 0
+  fi
+
+  # Case B: systemd-resolved race
   if pct exec "$ctid" -- systemctl list-unit-files systemd-resolved.service >/dev/null 2>&1; then
     warn "  DNS not resolving inside CT $ctid — restarting systemd-resolved as recovery..."
     pct exec "$ctid" -- systemctl restart systemd-resolved 2>&1 | sed 's/^/    /' || true

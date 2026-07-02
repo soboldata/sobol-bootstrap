@@ -96,11 +96,11 @@ ADMIN_NOTIFY_EMAIL set. `--test-only` lets you verify without re-config.
 
 ## Entries
 
-## 2026-07-02 xx:xx CT — Mattermost install fails DNS resolution after /dev/net/tun reboot (Ubuntu 24 CT)
+## 2026-07-02 xx:xx CT — CT can't resolve DNS because its resolv.conf points at Tailscale MagicDNS from an unjoined CT
 
 **Symptom:** Real-hardware install of `setup-mattermost.sh` on `creator`
-PVE host stalled for ~5 min after the "Waiting for CT to come back
-after reboot..." log line, then produced:
+PVE host stalled ~5 min after "Waiting for CT to come back after
+reboot...", then produced:
 
 ```
 W: Failed to fetch http://archive.ubuntu.com/ubuntu/dists/noble/InRelease
@@ -110,47 +110,95 @@ curl: (6) Could not resolve host: tailscale.com
 lxc-attach: 100: ... Failed to exec "tailscale"
 ```
 
-Ping to `1.1.1.1` succeeded inside the CT but hostname resolution
-failed for every remote — `apt-get update`, then `curl | sh` from
-tailscale.com, then `tailscale up`.
+Ping to `1.1.1.1` from inside the CT worked (IP was fine). But every
+hostname resolution failed.
 
-**Root cause:** Race between the CT's post-reboot `systemd-resolved`
-coming up and the addon's next `pct exec` call. Community-scripts
-installs Mattermost on Ubuntu 24 (noble), which uses systemd-resolved
-as the local DNS resolver. After we add `/dev/net/tun` passthrough via
-LXC config and `pct reboot`, systemd-resolved takes a few seconds to
-start. During that gap, `getent hosts <anything>` fails.
+**Diagnostic output:**
 
-Our readiness check was ping-only (`ping -c1 -W2 1.1.1.1`), which
-tests IP connectivity but returns green while DNS is still down. False
-green → downstream commands hit "Temporary failure resolving".
-
-**Fix (in code, per CLAUDE.md "Install debugging: fix the script"):**
-New shared library `addons/lib/ct-helpers.sh` with `ct_wait_ready()`
-that waits for IP + DNS + restarts systemd-resolved as recovery if DNS
-doesn't come up in the normal window. `setup-mattermost.sh` now sources
-the library and calls `ct_wait_ready "$CTID"` instead of its ad-hoc
-sleep+ping loop.
-
-**Files / Commit:** `addons/lib/ct-helpers.sh` (new — sourceable);
-`addons/setup-mattermost.sh` (sources the helper + replaces reboot-wait block).
-Follow-up task #247 migrates other addons (setup-n8n, setup-new-pi-agent,
-setup-postgres-shared) to use the same helper.
-
-**Immediate remediation for a stuck box:**
-```bash
-# Kick DNS back up manually
-pct exec 100 -- systemctl restart systemd-resolved
-sleep 5
-pct exec 100 -- getent hosts tailscale.com   # confirm working
-# Then re-run the addon (idempotent — picks up where it left off)
-cd /root/sobol-foundation && ./addons/setup-mattermost.sh
+```
+# pct exec 100 -- cat /etc/resolv.conf
+# --- BEGIN PVE ---
+search tailc4f63c.ts.net
+nameserver 100.100.100.100
+nameserver fd7a:115c:a1e0::53
+# --- END PVE ---
+# pct exec 100 -- systemctl status systemd-resolved
+Active: active (running) since Thu 2026-07-02 07:34:15 CDT; 9min ago
 ```
 
-**Related:** Any addon that does `pct reboot` + `pct exec apt-get`
-downstream is vulnerable to this. Migrate them all to `ct_wait_ready`.
-Also apt-get `-qq` mode had been silencing all progress — dropped that
-so operators can see what step they're in.
+**Root cause:** The CT's `/etc/resolv.conf` points at Tailscale
+MagicDNS (`100.100.100.100`) — but the CT is not on the tailnet yet.
+systemd-resolved is running fine, it's just configured to send queries
+to an unreachable server.
+
+Chain of events:
+1. `boot.sh` joined the PVE HOST to the customer tailnet
+2. Tailscale rewrote the host's `/etc/resolv.conf` to point at
+   `100.100.100.100`
+3. Community-scripts helper ran `pct create` for Mattermost — which
+   by default copies the host's `/etc/resolv.conf` into the new CT
+4. New CT inherited `100.100.100.100` as its nameserver
+5. New CT hasn't installed/joined Tailscale yet, so it can't reach
+   `100.100.100.100`
+6. All DNS lookups fail → apt fails → tailscale install fails
+
+This is a chicken-and-egg: to install Tailscale (which makes MagicDNS
+usable inside the CT), we need DNS. To have MagicDNS, we need
+Tailscale.
+
+**NOT the initial hypothesis:** I first assumed a systemd-resolved
+race after reboot. Wrong. resolved was up and stable; it was just
+configured against an unreachable server. Documenting the wrong turn
+so future debuggers don't chase the same hypothesis.
+
+**Fix (in code, per CLAUDE.md "Install debugging: fix the script"):**
+
+`addons/lib/ct-helpers.sh` has two new functions:
+
+- `ct_stage_public_dns <CTID>` — writes `1.1.1.1` + `8.8.8.8` to the
+  CT's `/etc/resolv.conf`. Idempotent. Tailscale will overwrite this
+  once `tailscale up --accept-dns` runs inside the CT.
+- `ct_fix_dns <CTID>` — smart recovery. Reads the CT's current
+  resolv.conf. If it points at `100.100.100.100` (Case A —
+  Tailscale MagicDNS from an unjoined CT), stages public DNS. If
+  systemd-resolved is present but flaky (Case B — original hypothesis,
+  still worth trying), restarts it.
+
+`ct_wait_ready()` calls `ct_fix_dns` automatically if the initial DNS
+check fails, then retries. This means every addon that calls
+`ct_wait_ready` gets the fix for free.
+
+`setup-mattermost.sh` sources the library and uses `ct_wait_ready`
+after the LXC config edit + reboot.
+
+**Files / Commit:** `addons/lib/ct-helpers.sh` (adds
+`ct_stage_public_dns` + smarter `ct_fix_dns`); `addons/setup-mattermost.sh`
+(sources helper, uses `ct_wait_ready`); TROUBLESHOOTING_LOG entry
+(this one).
+
+**Immediate remediation for a stuck box:**
+
+```bash
+# Stage public DNS in the CT manually
+pct exec 100 -- bash -c "cat > /etc/resolv.conf <<'EOF'
+nameserver 1.1.1.1
+nameserver 8.8.8.8
+EOF"
+
+# Confirm resolution works
+pct exec 100 -- getent hosts tailscale.com
+
+# Re-run the addon (idempotent — picks up where it left off)
+cd /root/sobol-foundation && git pull && ./addons/setup-mattermost.sh
+```
+
+**Related:** ANY addon that does `pct create` after joining the PVE
+host to a tailnet is vulnerable. Task #247 migrates
+setup-n8n / setup-new-pi-agent / setup-postgres-shared etc. to use
+`ct_wait_ready` so they inherit this fix. Consider also fixing at CT
+creation time by passing `--nameserver 1.1.1.1` to `pct create` — but
+community-scripts helpers don't accept nameserver overrides, so the
+post-create staging is the reliable path.
 
 ---
 

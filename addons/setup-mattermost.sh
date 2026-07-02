@@ -282,11 +282,19 @@ if (( ! EXISTING_CT )); then
     fi
   fi
 
+  # Prefer CT_PASSWORD from /root/td-tokens.txt (boot.sh persists it there
+  # via upsert_token before any addon runs). Falls back to prompt for
+  # legacy install paths that didn't collect it upfront.
+  if [[ -z "$CT_PASSWORD" ]]; then
+    CT_PASSWORD="$(read_from_tokens CT_PASSWORD 2>/dev/null || true)"
+    [[ -n "$CT_PASSWORD" ]] && log "Reusing CT_PASSWORD from $TOKENS_FILE."
+  fi
   if [[ -z "$CT_PASSWORD" ]]; then
     if (( DRY_RUN )); then CT_PASSWORD="dryrun-ct-pw"; else
       printf "\n\033[1;36m[setup-mattermost]\033[0m CT root password (for console fallback): " >&2
       IFS= read -rs CT_PASSWORD; echo >&2
       [[ -n "$CT_PASSWORD" ]] || die "CT password required."
+      upsert_token CT_PASSWORD "$CT_PASSWORD"
     fi
   fi
 
@@ -583,7 +591,13 @@ print(json.dumps(c))
         # Write the config payload to a temp file inside the CT so we don't
         # have to worry about shell-escaping a multi-MB JSON blob.
         echo "$NEW_CFG" | pct exec "$CTID" -- tee /tmp/mm-config.json >/dev/null
-        PUT_STATUS=$(pct exec "$CTID" -- bash -lc "curl -sS -o /dev/null -w '%{http_code}' -X PUT $AUTH_HEADER -H 'Content-Type: application/json' --data-binary @/tmp/mm-config.json 'http://127.0.0.1:8065/api/v4/config'" 2>/dev/null || echo "000")
+        # Capture body AND status. Newline before %{http_code} lets us split
+        # cleanly with head/tail. On 400/500 the body carries the actual
+        # error message ("app.X.validate.mustberequired", etc.) which is
+        # what we need to fix schema issues in MM version bumps.
+        PUT_RESP=$(pct exec "$CTID" -- bash -lc "curl -sS -w $'\n%{http_code}' -X PUT $AUTH_HEADER -H 'Content-Type: application/json' --data-binary @/tmp/mm-config.json 'http://127.0.0.1:8065/api/v4/config'" 2>/dev/null || printf '\n000')
+        PUT_STATUS=$(echo "$PUT_RESP" | tail -1)
+        PUT_BODY=$(echo "$PUT_RESP" | sed '$d')
         if [[ "$PUT_STATUS" == "200" ]]; then
           log "  Config updated. Restarting Mattermost to apply..."
           run "pct exec $CTID -- systemctl restart mattermost"
@@ -598,7 +612,16 @@ print(json.dumps(c))
           SESSION_TOKEN=$(echo "$LOGIN_RESP" | awk '/^[Tt]oken:/ {print $2}' | tr -d '\r')
           AUTH_HEADER="-H 'Authorization: Bearer $SESSION_TOKEN'"
         else
-          warn "  Config update returned HTTP $PUT_STATUS — personal access tokens may not be enabled. Homepage widget will fall back to placeholder."
+          warn "  Config update returned HTTP $PUT_STATUS."
+          warn "  Response body (truncated to 800 chars):"
+          printf '%s\n' "$PUT_BODY" | head -c 800 | sed 's/^/    /' >&2
+          echo >&2
+          warn "  This blocks: EnableBotAccountCreation, EnableUserAccessTokens,"
+          warn "  AllowedUntrustedInternalConnections, and CORS/SiteURL fixes."
+          warn "  Downstream fallout: pi-bot 403, personal token mint 501,"
+          warn "  outgoing webhooks silently 500."
+          warn "  Fix: patch the JSON block above based on the error message,"
+          warn "  then re-run this script — it's idempotent against the existing CT."
         fi
       fi
     fi

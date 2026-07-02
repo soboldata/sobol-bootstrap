@@ -132,7 +132,17 @@ SMTP_FROM="$(read_token SMTP_FROM || echo "\"Ghost\" <no-reply@${DOMAIN}>")"
 TS_AUTHKEY="$(read_token TS_AUTHKEY || true)"
 CT_PASSWORD="$(read_token CT_PASSWORD || true)"
 
-GHOST_HELPER_URL="${GHOST_HELPER_URL:-https://github.com/community-scripts/ProxmoxVE/raw/main/ct/ghost.sh}"
+# ----- MariaDB dependency check -----------------------------------------
+# Ghost is MySQL-only (Postgres was dropped at Ghost 1.0). We depend on
+# a shared MariaDB CT provisioned by setup-mariadb-shared.sh, which
+# creates ghost_db + ghost_user with proper utf8mb4 charset.
+MARIADB_CTID="$(read_token MARIADB_CTID || true)"
+MARIADB_LISTEN_IP="$(read_token MARIADB_LISTEN_IP || true)"
+GHOST_DB_PASSWORD="$(read_token GHOST_DB_PASSWORD || true)"
+if [[ -z "$MARIADB_CTID" || -z "$MARIADB_LISTEN_IP" || -z "$GHOST_DB_PASSWORD" ]]; then
+  die "Missing MariaDB deps in $TOKENS_FILE (need MARIADB_CTID + MARIADB_LISTEN_IP + GHOST_DB_PASSWORD).
+  Run setup-mariadb-shared.sh first — it provisions the shared MariaDB CT + ghost_db."
+fi
 
 # Find CT by hostname (matches setup-postgres-shared.sh pattern from #267)
 find_ct_by_hostname() {
@@ -149,7 +159,11 @@ if [[ -n "$EXISTING_CTID" ]]; then
   log "  Found existing CT $EXISTING_CTID ($GHOST_HOSTNAME) — using it."
   GHOST_CTID="$EXISTING_CTID"
 else
-  log "  No CT named '$GHOST_HOSTNAME' found — creating via community-scripts ghost.sh..."
+  # Community-scripts dropped ct/ghost.sh in July 2026 (only ghostfolio.sh
+  # remains, unrelated). We create the CT directly via `pct create` + a
+  # Debian 12 template, then install Node.js 22 + ghost-cli natively.
+  # Matches the bootstrap-pve.sh direct-create pattern for ollama-pi-agent.
+  log "  No CT named '$GHOST_HOSTNAME' found — creating Debian 12 CT + installing Ghost natively..."
   [[ -n "$CT_PASSWORD" ]] || die "CT_PASSWORD required in $TOKENS_FILE to create a new CT."
 
   # Auto-allocate CTID if the preferred one is taken
@@ -158,65 +172,149 @@ else
     log "  Preferred CTID taken; auto-allocated $GHOST_CTID."
   fi
 
-  # SSH pubkey from authorized_keys (skip PVE auto-generated)
-  PVE_HOST="$(hostname -s)"
-  SSH_KEY=""
-  [[ -f /root/.ssh/authorized_keys ]] && \
-    SSH_KEY="$(awk -v skip="root@$PVE_HOST" '/^ssh-/ && $NF != skip { print; exit }' /root/.ssh/authorized_keys)"
+  # Resolve latest Debian 12 template (matches bootstrap-pve.sh pattern)
+  log "  Resolving Debian 12 template..."
+  pveam update >/dev/null 2>&1 || true
+  TEMPLATE_NAME="$(pveam available -section system 2>/dev/null | awk '/debian-12-standard.*amd64\.tar\.zst/ {print $2}' | sort | tail -1)"
+  [[ -n "$TEMPLATE_NAME" ]] || die "Could not find debian-12-standard template via 'pveam available'"
+  # Ensure template is downloaded
+  if ! ls /var/lib/vz/template/cache/${TEMPLATE_NAME} >/dev/null 2>&1; then
+    log "  Downloading template $TEMPLATE_NAME..."
+    pveam download local "$TEMPLATE_NAME" 2>&1 | tail -3
+  fi
+  TEMPLATE_REF="local:vztmpl/$TEMPLATE_NAME"
 
+  # SSH pubkey file — bootstrap-pve.sh writes /root/workstation.pub
+  AUTHKEYS_FILE=""
+  for f in /root/workstation.pub /root/.ssh/authorized_keys; do
+    [[ -s "$f" ]] && { AUTHKEYS_FILE="$f"; break; }
+  done
+  [[ -n "$AUTHKEYS_FILE" ]] || die "No SSH pubkey found. Boot.sh should have written /root/workstation.pub."
+
+  # Resources — Ghost 6.0 wants 2 GB RAM min, 1 GB swap, ~5 GB disk
+  # (Node + npm caches inflate; give headroom)
   if (( DRY_RUN )); then
-    log "  [dry-run] would run community-scripts ghost.sh (CTID=$GHOST_CTID, hostname=$GHOST_HOSTNAME)"
+    log "  [dry-run] would pct create $GHOST_CTID with hostname=$GHOST_HOSTNAME, 2 cpu, 2GB RAM, 8GB disk"
   else
-    var_ctid="$GHOST_CTID" \
-    var_hostname="$GHOST_HOSTNAME" \
-    var_ssh=yes \
-    var_ssh_authorized_key="$SSH_KEY" \
-    var_gpu=no \
-    bash -c "$(curl -fsSL "$GHOST_HELPER_URL")"
+    log "  Creating CT $GHOST_CTID ($GHOST_HOSTNAME)..."
+    pct create "$GHOST_CTID" "$TEMPLATE_REF" \
+      --hostname "$GHOST_HOSTNAME" \
+      --password "$CT_PASSWORD" \
+      --ssh-public-keys "$AUTHKEYS_FILE" \
+      --cores 2 \
+      --memory 2048 \
+      --swap 1024 \
+      --rootfs "local-lvm:8" \
+      --net0 'name=eth0,bridge=vmbr0,ip=dhcp,ip6=auto' \
+      --features nesting=1 \
+      --unprivileged 1 \
+      --onboot 1 \
+      --start 0
 
-    # Detect actual CTID (helper may have chosen a different one)
-    ACTUAL_CTID="$(find_ct_by_hostname "$GHOST_HOSTNAME" 2>/dev/null || true)"
-    if [[ -n "$ACTUAL_CTID" && "$ACTUAL_CTID" != "$GHOST_CTID" ]]; then
-      log "  Helper assigned CTID $ACTUAL_CTID — switching."
-      GHOST_CTID="$ACTUAL_CTID"
-    fi
-    [[ -n "$GHOST_CTID" ]] || die "Ghost CT didn't come up — see community-scripts output above."
-    upsert_token GHOST_CTID "$GHOST_CTID"
-
-    # TUN passthrough so Tailscale can run
+    # TUN passthrough for Tailscale (must be BEFORE first start)
     CT_CONF="/etc/pve/lxc/$GHOST_CTID.conf"
     if ! grep -q "/dev/net/tun" "$CT_CONF" 2>/dev/null; then
-      log "  Adding /dev/net/tun passthrough..."
       cat >> "$CT_CONF" <<'TUN_BLOCK'
 lxc.cgroup2.devices.allow: c 10:200 rwm
 lxc.mount.entry: /dev/net/tun dev/net/tun none bind,create=file
 TUN_BLOCK
-      pct reboot "$GHOST_CTID"
-      log "  Waiting for CT to come back after reboot..."
-      declare -F ct_wait_ready >/dev/null && ct_wait_ready "$GHOST_CTID" || sleep 15
     fi
 
-    # Tailscale install + join
+    pct start "$GHOST_CTID"
+    log "  Waiting for CT to be ready (IP + DNS)..."
+    declare -F ct_wait_ready >/dev/null && ct_wait_ready "$GHOST_CTID" || sleep 20
+
+    upsert_token GHOST_CTID "$GHOST_CTID"
+
+    # Tailscale install + join (via ts_ensure_joined helper)
     if [[ -n "$TS_AUTHKEY" ]] && declare -F ts_ensure_joined >/dev/null; then
       log "  Installing tailscale + joining tailnet as '$GHOST_HOSTNAME'..."
-      if ! pct exec "$GHOST_CTID" -- tailscale --version >/dev/null 2>&1; then
-        pct exec "$GHOST_CTID" -- bash -lc '
-          set -e
-          export DEBIAN_FRONTEND=noninteractive
-          . /etc/os-release
-          apt-get update -qq
-          apt-get install -y -qq curl ca-certificates
-          curl -fsSL "https://pkgs.tailscale.com/stable/${ID}/${VERSION_CODENAME}.noarmor.gpg" \
-            | tee /usr/share/keyrings/tailscale-archive-keyring.gpg >/dev/null
-          echo "deb [signed-by=/usr/share/keyrings/tailscale-archive-keyring.gpg] https://pkgs.tailscale.com/stable/${ID} ${VERSION_CODENAME} main" \
-            > /etc/apt/sources.list.d/tailscale.list
-          apt-get update -qq
-          apt-get install -y -qq tailscale
-        ' 2>&1 | sed 's/^/    /'
-      fi
+      pct exec "$GHOST_CTID" -- bash -lc '
+        set -e
+        export DEBIAN_FRONTEND=noninteractive
+        . /etc/os-release
+        apt-get update -qq
+        apt-get install -y -qq curl ca-certificates gnupg
+        curl -fsSL "https://pkgs.tailscale.com/stable/${ID}/${VERSION_CODENAME}.noarmor.gpg" \
+          | tee /usr/share/keyrings/tailscale-archive-keyring.gpg >/dev/null
+        echo "deb [signed-by=/usr/share/keyrings/tailscale-archive-keyring.gpg] https://pkgs.tailscale.com/stable/${ID} ${VERSION_CODENAME} main" \
+          > /etc/apt/sources.list.d/tailscale.list
+        apt-get update -qq
+        apt-get install -y -qq tailscale
+      ' 2>&1 | sed 's/^/    /'
       ts_ensure_joined "$GHOST_CTID" "$TS_AUTHKEY" "$GHOST_HOSTNAME" || \
         warn "  Tailscale join returned non-zero — continuing (LAN-only fallback ok)."
     fi
+
+    # ----- Install Node.js 22 + build tooling + ghost-cli ---------------
+    # Ghost 6.0 requires Node 22.13+. NodeSource maintains an up-to-date
+    # Debian repo; using it avoids Debian's stale packaged node.
+    log "  Installing Node.js 22 + build tooling..."
+    pct exec "$GHOST_CTID" -- bash -lc '
+      set -e
+      export DEBIAN_FRONTEND=noninteractive
+      apt-get update -qq
+      apt-get install -y -qq curl ca-certificates gnupg build-essential python3
+      # NodeSource setup script — pins the correct apt repo for node 22.x
+      curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
+      apt-get install -y -qq nodejs
+      node --version
+      npm --version
+    ' 2>&1 | sed 's/^/    /'
+
+    log "  Installing ghost-cli globally..."
+    pct exec "$GHOST_CTID" -- bash -lc 'npm install -g ghost-cli@latest' 2>&1 | sed 's/^/    /'
+
+    # ----- Create ghost-mgr user (ghost-cli refuses to run as root) -----
+    # ghost-cli hard-refuses root since 1.5.0. Standard pattern is a
+    # dedicated sudo-capable "mgr" user under which `ghost install`
+    # runs; ghost install then creates a SECOND daemon user called
+    # 'ghost' (no shell) that owns the systemd unit and content dir.
+    log "  Creating ghost-mgr user with passwordless sudo..."
+    pct exec "$GHOST_CTID" -- bash -lc "
+      set -e
+      if ! id ghost-mgr >/dev/null 2>&1; then
+        useradd -m -s /bin/bash -G sudo ghost-mgr
+      fi
+      # Passwordless sudo for ghost-install commands
+      echo 'ghost-mgr ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/ghost-mgr
+      chmod 440 /etc/sudoers.d/ghost-mgr
+      # Ghost install dir — must be /var/www/<name>, NOT /home or /root
+      # (ghost-cli generates permissions errors otherwise)
+      mkdir -p /var/www/ghost
+      chown ghost-mgr:ghost-mgr /var/www/ghost
+      chmod 755 /var/www/ghost
+    "
+
+    # ----- Run ghost install (non-interactive) --------------------------
+    # --db mysql --dbhost <mariadb-tailnet-ip> --dbuser ghost_user
+    # --dbpass <from-tokens> --dbname ghost_db
+    # --no-setup-nginx --no-setup-ssl — Cloudflared handles ingress
+    # --no-prompt — feed all answers via flags; die if anything's missing
+    # --no-setup-systemd — we set up the unit ourselves via ghost start
+    #                     (Ghost's systemd unit generation still works
+    #                     via 'ghost start', which creates ghost_<name>.service)
+    log "  Running ghost install as ghost-mgr (this takes 2-3 min)..."
+    pct exec "$GHOST_CTID" -- bash -lc "
+      set -e
+      su - ghost-mgr -c '
+        cd /var/www/ghost && \
+        ghost install \
+          --no-prompt \
+          --no-setup-nginx \
+          --no-setup-ssl \
+          --url https://$DOMAIN \
+          --db mysql \
+          --dbhost $MARIADB_LISTEN_IP \
+          --dbport 3306 \
+          --dbuser ghost_user \
+          --dbpass \"$GHOST_DB_PASSWORD\" \
+          --dbname ghost_db \
+          --port 2368 \
+          --process systemd \
+          --ip 0.0.0.0
+      '
+    " 2>&1 | sed 's/^/    /'
   fi
 fi
 

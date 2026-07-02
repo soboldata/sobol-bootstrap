@@ -275,7 +275,11 @@ ts_ensure_joined() {
   # (For CTs: bootstrap-pve.sh installs it via the tailscale add-on. For
   # the host: boot.sh installs it via https://tailscale.com/install.sh.
   # This helper only VERIFIES; it doesn't install.)
-  if ! $exec_prefix command -v tailscale >/dev/null 2>&1; then
+  #
+  # NB. `command -v` is a bash builtin — `pct exec CT -- command -v X`
+  # fails via execvp regardless of whether X is installed. Invoke the
+  # binary itself instead (works for both host and pct exec paths).
+  if ! $exec_prefix tailscale --version >/dev/null 2>&1; then
     warn "  $label: tailscale binary not installed — helper won't install, that's the caller's job"
     return 1
   fi

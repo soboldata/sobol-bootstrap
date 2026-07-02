@@ -129,8 +129,12 @@ if (( ! HOST_ONLY )); then
       log "  Skipping CT $ctid (not running — start with 'pct start $ctid' first)"
       continue
     fi
-    # Must have tailscale binary
-    if ! pct exec "$ctid" -- command -v tailscale >/dev/null 2>&1; then
+    # Must have tailscale binary present + executable.
+    # NB. `command -v` is a bash builtin, so `pct exec CT -- command -v X`
+    # fails via execvp regardless of whether X is installed. Test by
+    # invoking the binary itself (which pct exec resolves through PATH
+    # the same way bootstrap-pve.sh's tailscale up call does).
+    if ! pct exec "$ctid" -- tailscale --version >/dev/null 2>&1; then
       log "  Skipping CT $ctid (no tailscale binary — was bootstrap-pve.sh's Tailscale step ever run for it?)"
       continue
     fi

@@ -107,16 +107,128 @@ upsert_token() {
 # ----- pre-flight --------------------------------------------------------
 log "Pre-flight..."
 
+# Shared CT lifecycle helpers (ct_wait_ready, ts_ensure_joined, etc).
+# shellcheck source=lib/ct-helpers.sh
+if [[ -r "$(dirname "${BASH_SOURCE[0]}")/lib/ct-helpers.sh" ]]; then
+  source "$(dirname "${BASH_SOURCE[0]}")/lib/ct-helpers.sh"
+fi
+
 POSTGRES_CTID="$(read_token POSTGRES_CTID || echo 303)"
+POSTGRES_HOSTNAME="${POSTGRES_HOSTNAME:-postgres}"
 ADMIN_USER="$(read_token ADMIN_USER || true)"
 ADMIN_PASSWORD="$(read_token ADMIN_PASSWORD || true)"
 DOMAIN="$(read_token DOMAIN || true)"
 
+# Community-scripts CT-creation prerequisites — used only when we need to
+# CREATE a new postgres CT (skipped when one already exists).
+TS_AUTHKEY="$(read_token TS_AUTHKEY || true)"
+CT_PASSWORD="$(read_token CT_PASSWORD || true)"
+
 [[ -n "$ADMIN_USER" && -n "$ADMIN_PASSWORD" ]] || die "Need ADMIN_USER + ADMIN_PASSWORD in $TOKENS_FILE."
 
-# Verify CT exists + running
+# ----- CT-detection or auto-create --------------------------------------
+# Look up by hostname (community-scripts helpers assign CTIDs dynamically,
+# so relying on the static default 303 is unreliable). If a CT named
+# 'postgres' exists, use it. Otherwise invoke community-scripts postgresql
+# helper to create one. Matches setup-mattermost.sh pattern.
+POSTGRES_HELPER_URL="${POSTGRES_HELPER_URL:-https://github.com/community-scripts/ProxmoxVE/raw/main/ct/postgresql.sh}"
+
+# Find CT by hostname
+find_ct_by_hostname() {
+  local want="$1" c hn
+  for c in $(pct list 2>/dev/null | awk 'NR>1 {print $1}'); do
+    hn="$(pct config "$c" 2>/dev/null | awk '/^hostname:/ {print $2}')"
+    [[ "$hn" == "$want" ]] && { echo "$c"; return 0; }
+  done
+  return 1
+}
+
+EXISTING_CTID="$(find_ct_by_hostname "$POSTGRES_HOSTNAME" 2>/dev/null || true)"
+if [[ -n "$EXISTING_CTID" ]]; then
+  log "  Found existing CT $EXISTING_CTID ($POSTGRES_HOSTNAME) — using it."
+  POSTGRES_CTID="$EXISTING_CTID"
+else
+  log "  No CT named '$POSTGRES_HOSTNAME' found — creating via community-scripts postgresql.sh..."
+  [[ -n "$CT_PASSWORD" ]] || die "CT_PASSWORD required in $TOKENS_FILE to create a new CT."
+
+  # Auto-allocate CTID if the preferred one is taken (matches setup-mattermost.sh).
+  if pct status "$POSTGRES_CTID" >/dev/null 2>&1; then
+    POSTGRES_CTID="$(pvesh get /cluster/nextid 2>/dev/null | tr -d '"')"
+    log "  Preferred CTID taken; auto-allocated $POSTGRES_CTID."
+  fi
+
+  # Pick up SSH pubkey the same way bootstrap-pve.sh does — first workstation
+  # key from authorized_keys, skipping the PVE auto-generated root@host key.
+  PVE_HOST="$(hostname -s)"
+  SSH_KEY=""
+  [[ -f /root/.ssh/authorized_keys ]] && \
+    SSH_KEY="$(awk -v skip="root@$PVE_HOST" '/^ssh-/ && $NF != skip { print; exit }' /root/.ssh/authorized_keys)"
+
+  if (( DRY_RUN )); then
+    log "  [dry-run] would run community-scripts postgresql.sh (CTID=$POSTGRES_CTID, hostname=$POSTGRES_HOSTNAME)"
+  else
+    var_ctid="$POSTGRES_CTID" \
+    var_hostname="$POSTGRES_HOSTNAME" \
+    var_ssh=yes \
+    var_ssh_authorized_key="$SSH_KEY" \
+    var_gpu=no \
+    bash -c "$(curl -fsSL "$POSTGRES_HELPER_URL")"
+
+    # Helper may pick a different CTID if it collided; re-detect by hostname.
+    ACTUAL_CTID="$(find_ct_by_hostname "$POSTGRES_HOSTNAME" 2>/dev/null || true)"
+    if [[ -n "$ACTUAL_CTID" && "$ACTUAL_CTID" != "$POSTGRES_CTID" ]]; then
+      log "  Helper assigned CTID $ACTUAL_CTID (not $POSTGRES_CTID) — switching."
+      POSTGRES_CTID="$ACTUAL_CTID"
+    fi
+    [[ -n "$POSTGRES_CTID" ]] || die "Postgres CT didn't come up — see community-scripts output above."
+    upsert_token POSTGRES_CTID "$POSTGRES_CTID"
+
+    # Add /dev/net/tun passthrough so Tailscale can run (matches
+    # bootstrap-pve.sh / setup-mattermost.sh CT creation).
+    CT_CONF="/etc/pve/lxc/$POSTGRES_CTID.conf"
+    if ! grep -q "/dev/net/tun" "$CT_CONF" 2>/dev/null; then
+      log "  Adding /dev/net/tun passthrough..."
+      cat >> "$CT_CONF" <<'TUN_BLOCK'
+lxc.cgroup2.devices.allow: c 10:200 rwm
+lxc.mount.entry: /dev/net/tun dev/net/tun none bind,create=file
+TUN_BLOCK
+      pct reboot "$POSTGRES_CTID"
+      log "  Waiting for CT to come back after reboot (IP + DNS)..."
+      declare -F ct_wait_ready >/dev/null && ct_wait_ready "$POSTGRES_CTID" \
+        || sleep 15
+    fi
+
+    # Join the tailnet. Uses ts_ensure_joined from ct-helpers.sh which
+    # installs tailscale if missing, then handles the two-tier
+    # up/--force-reauth pattern. Skip if no TS_AUTHKEY (installer might
+    # be running against a LAN-only stack).
+    if [[ -n "$TS_AUTHKEY" ]] && declare -F ts_ensure_joined >/dev/null; then
+      log "  Installing tailscale + joining tailnet as '$POSTGRES_HOSTNAME'..."
+      # First: install tailscale package if the community helper didn't.
+      if ! pct exec "$POSTGRES_CTID" -- tailscale --version >/dev/null 2>&1; then
+        pct exec "$POSTGRES_CTID" -- bash -lc '
+          set -e
+          export DEBIAN_FRONTEND=noninteractive
+          . /etc/os-release
+          apt-get update -qq
+          apt-get install -y -qq curl ca-certificates
+          curl -fsSL "https://pkgs.tailscale.com/stable/${ID}/${VERSION_CODENAME}.noarmor.gpg" \
+            | tee /usr/share/keyrings/tailscale-archive-keyring.gpg >/dev/null
+          echo "deb [signed-by=/usr/share/keyrings/tailscale-archive-keyring.gpg] https://pkgs.tailscale.com/stable/${ID} ${VERSION_CODENAME} main" \
+            > /etc/apt/sources.list.d/tailscale.list
+          apt-get update -qq
+          apt-get install -y -qq tailscale
+        ' 2>&1 | sed 's/^/    /'
+      fi
+      ts_ensure_joined "$POSTGRES_CTID" "$TS_AUTHKEY" "$POSTGRES_HOSTNAME" || \
+        warn "  Tailscale join returned non-zero — continuing (LAN-only fallback ok)."
+    fi
+  fi
+fi
+
+# Verify CT is running (whether we found it or just created it)
 if ! pct status "$POSTGRES_CTID" 2>/dev/null | grep -q running; then
-  die "CT $POSTGRES_CTID not running. Run bootstrap-pve.sh first or 'pct start $POSTGRES_CTID'."
+  die "CT $POSTGRES_CTID not running. Try: pct start $POSTGRES_CTID"
 fi
 
 # Get the postgres CT's tailnet IP for connection URLs

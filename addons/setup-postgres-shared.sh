@@ -167,12 +167,23 @@ else
   if (( DRY_RUN )); then
     log "  [dry-run] would run community-scripts postgresql.sh (CTID=$POSTGRES_CTID, hostname=$POSTGRES_HOSTNAME)"
   else
+    # Fetch helper to temp file first (same reason as setup-ghost.sh 2026-07-02
+    # fix): bash -c "$(curl ...)" swallows curl's exit code, so a 404 silently
+    # runs an empty bash script and the addon proceeds as if CT was created.
+    HELPER_TMP="$(mktemp /tmp/postgres-helper.XXXXXX.sh)"
+    if ! curl -fsSL "$POSTGRES_HELPER_URL" -o "$HELPER_TMP" || [[ ! -s "$HELPER_TMP" ]]; then
+      rm -f "$HELPER_TMP"
+      die "Postgres helper fetch failed or returned empty. URL: $POSTGRES_HELPER_URL
+  Check community-scripts current layout: https://community-scripts.github.io/ProxmoxVE/scripts
+  Override with: POSTGRES_HELPER_URL=<new-url> $0"
+    fi
     var_ctid="$POSTGRES_CTID" \
     var_hostname="$POSTGRES_HOSTNAME" \
     var_ssh=yes \
     var_ssh_authorized_key="$SSH_KEY" \
     var_gpu=no \
-    bash -c "$(curl -fsSL "$POSTGRES_HELPER_URL")"
+    bash "$HELPER_TMP"
+    rm -f "$HELPER_TMP"
 
     # Helper may pick a different CTID if it collided; re-detect by hostname.
     ACTUAL_CTID="$(find_ct_by_hostname "$POSTGRES_HOSTNAME" 2>/dev/null || true)"

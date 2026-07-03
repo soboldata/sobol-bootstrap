@@ -96,6 +96,69 @@ ADMIN_NOTIFY_EMAIL set. `--test-only` lets you verify without re-config.
 
 ## Entries
 
+## 2026-07-02 xx:xx CT — Mattermost 10 config PUT 400: "Site URL cannot be cleared"
+
+**Symptom:** Fresh install (or re-run) of `setup-mattermost.sh` against a
+Mattermost 10.x install returned HTTP 400 on `PUT /api/v4/config`:
+
+```
+{"id":"api.config.update_config.clear_siteurl.app_error",
+ "message":"Site URL cannot be cleared",
+ "detailed_error":"","request_id":"...","status_code":400}
+```
+
+Downstream fallout was severe: `EnableBotAccountCreation`,
+`EnableUserAccessTokens`, `AllowedUntrustedInternalConnections`,
+`EnableDynamicClientRegistration` all failed to apply. Result:
+- Personal access token mint → HTTP 501 (`app.user_access_token.disabled`)
+- pi-bot creation → HTTP 403 (`api.bot.create_disabled`)
+- Every downstream addon that expects a valid MATTERMOST_BOT_TOKEN
+  writes `(empty)` to tokens and silently degrades
+
+**Root cause:** Mattermost 9 accepted `SiteURL=''` as "trust the
+request" — MM's WebSocket handler would validate Host/Origin against
+whatever the client used, so access via LAN IP AND MagicDNS hostname
+AND Tailscale FQDN all worked. This was the recommended install-time
+posture for a stack that gets accessed via multiple names.
+
+Mattermost 10 removed that behavior. SiteURL is now mandatory. Any
+config PUT with `ServiceSettings.SiteURL=''` gets rejected wholesale
+— not just the SiteURL field but the entire PUT — with the 400
+above. Since our PUT bundles bot-creation-enable, token-enable, SSRF
+whitelist, and every other flag we care about into a single call, one
+rejected field takes the whole config change down with it.
+
+**Fix:** Set SiteURL to the MagicDNS hostname (`http://mattermost:8065`)
+instead of clearing it. This is stable across LAN/tailnet reboots
+because MagicDNS assigns hostnames consistently. Trade-off: WebSocket
+clients accessing via the raw LAN IP will see a Host mismatch and
+downgrade to long-polling. That's acceptable because:
+- Customer default is tailnet access via `mattermost:8065` (works)
+- LAN IP path is only a bootstrap fallback
+- Long-polling degrades UX but doesn't break MM
+
+**Debugging assist that made this fixable in one iteration:**
+`curl -sS -o /dev/null -w '%{http_code}'` was discarding the response
+body. Changed to `curl -sS -w '\n%{http_code}'` + head/tail split so
+non-200 responses surface the actual MM error message. Without that
+change we'd have known "config PUT 400s" but not why. First run with
+the diagnostic patch surfaced the exact error and the fix was one
+line. Worth generalizing this pattern to other addons.
+
+**Files / Commit:**
+- `sobol-foundation/addons/setup-mattermost.sh` — SiteURL='' →
+  SiteURL='http://\$HOSTNAME:8065' in the config PUT Python block
+  (around line 539)
+- Same file — PUT response body capture (line 590-596)
+
+**Related:** the earlier `api.bot.create_disabled` 403 entry chased
+the wrong root cause (credential persistence) — which WAS a real bug
+but not the whole picture. On a fully-tokens-populated install (this
+run), credential persistence was fine and MM10's SiteURL enforcement
+was the last blocker. Both fixes are now landed.
+
+---
+
 ## 2026-07-02 xx:xx CT — Re-running installer after deleting devices from tailnet admin panel leaves everything "installed but stale"
 
 **Symptom:** Operator did a first install, then deleted all the Sobol

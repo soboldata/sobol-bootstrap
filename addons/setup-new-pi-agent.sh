@@ -200,6 +200,13 @@ if [[ -z "$TS_AUTHKEY" ]]; then
 fi
 
 # ----- resolve CT root password --------------------------------------------
+# Prefer CT_PASSWORD from /root/td-tokens.txt (boot.sh persists it there
+# via upsert_token). Falls back to prompt for older install paths that
+# didn't collect it upfront.
+if [[ -z "$CT_PASSWORD" ]] && [[ -f /root/td-tokens.txt ]]; then
+  CT_PASSWORD="$(awk -F= '$1 == "CT_PASSWORD" { sub(/^[^=]*=/, "", $0); print; exit }' /root/td-tokens.txt 2>/dev/null || true)"
+  [[ -n "$CT_PASSWORD" ]] && log "Reusing CT_PASSWORD from /root/td-tokens.txt."
+fi
 if [[ -z "$CT_PASSWORD" ]]; then
   if (( DRY_RUN )); then
     CT_PASSWORD="dryrun-placeholder-pw"

@@ -1590,19 +1590,28 @@ configure_email() {
     fi
   fi
 
-  # Find setup-pve-email.sh — repo-relative first, fall back to /root/td-proxmox
+  # Find setup-pve-email.sh — repo-relative first, then the standard install
+  # clone paths, then a raw fetch from the origin this install was cloned
+  # from. (Historical bug: the last resort was hardcoded to an internal LAN
+  # Gitea no customer box can reach.) This is the PUBLIC bootstrap: there is
+  # no valid default origin, so without SOBOL_REPO_URL we fail with
+  # instructions instead of curling a dead address.
   local SCRIPT_DIR
   SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
   local EMAIL_ADDON="$SCRIPT_DIR/../addons/setup-pve-email.sh"
+  local _p
+  for _p in /root/sobol-foundation/addons/setup-pve-email.sh \
+            /root/td-proxmox/repo/addons/setup-pve-email.sh; do
+    [[ -f "$EMAIL_ADDON" ]] && break
+    EMAIL_ADDON="$_p"
+  done
   if [[ ! -f "$EMAIL_ADDON" ]]; then
-    EMAIL_ADDON="/root/td-proxmox/repo/addons/setup-pve-email.sh"
-  fi
-  if [[ ! -f "$EMAIL_ADDON" ]]; then
-    # Last resort: fetch from Gitea raw URL
+    [[ -n "${SOBOL_REPO_URL:-}" ]] \
+      || die "setup-pve-email.sh not found locally and SOBOL_REPO_URL is unset. Add the file at addons/setup-pve-email.sh (a complete clone has it) or export SOBOL_REPO_URL."
     EMAIL_ADDON="/tmp/setup-pve-email.sh"
-    log "  setup-pve-email.sh not found locally — fetching from Gitea..."
+    log "  setup-pve-email.sh not found locally — fetching from ${SOBOL_REPO_URL%.git}..."
     curl -fsSL -o "$EMAIL_ADDON" \
-      "http://10.27.0.190:3000/admin/td-proxmox/raw/branch/main/addons/setup-pve-email.sh" \
+      "${SOBOL_REPO_URL%.git}/raw/branch/main/addons/setup-pve-email.sh" \
       || die "Failed to fetch setup-pve-email.sh. Add the file at addons/setup-pve-email.sh."
     chmod +x "$EMAIL_ADDON"
   fi
